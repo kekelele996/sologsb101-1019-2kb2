@@ -1,0 +1,158 @@
+/* 古籍修复工序与补纸配色档案 · 全局样式
+   藏青 + 宣纸米黄 + 赭石，字体走宋体系，保持修复室的档案观感。 */
+
+:root {
+  --gb-paper: #f6f2e8;
+  --gb-paper-light: #fffdf8;
+  --gb-ink: #2f2a24;
+  --gb-indigo: #3a4a6b;
+  --gb-ochre: #a8623a;
+  --gb-green: #1e8449;
+  --gb-line: rgba(58, 74, 107, 0.16);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--gb-paper);
+  color: var(--gb-ink);
+  font-family: 'Songti SC', 'Noto Serif SC', 'Source Han Serif SC', 'PingFang SC', 'Microsoft YaHei', serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 宣纸底纹 */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  opacity: 0.5;
+  background-image:
+    radial-gradient(circle at 10% 14%, rgba(168, 98, 58, 0.08), transparent 42%),
+    radial-gradient(circle at 88% 8%, rgba(58, 74, 107, 0.09), transparent 40%),
+    repeating-linear-gradient(0deg, rgba(47, 42, 36, 0.02) 0 1px, transparent 1px 4px);
+}
+
+#app {
+  position: relative;
+  z-index: 1;
+}
+
+/* ---------------- 通用面板 ---------------- */
+.gb-panel {
+  background: var(--gb-paper-light);
+  border: 1px solid var(--gb-line);
+  border-radius: 10px;
+  padding: 16px;
+  box-shadow: 0 2px 10px rgba(47, 42, 36, 0.05);
+}
+
+.gb-panel + .gb-panel {
+  margin-top: 16px;
+}
+
+.gb-page-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.gb-page-head h2 {
+  margin: 0;
+  font-size: 20px;
+  letter-spacing: 1px;
+}
+
+.gb-page-head p {
+  margin: 4px 0 0;
+  font-size: 13px;
+  color: #7a6f64;
+}
+
+.gb-stat-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.gb-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.gb-book-card {
+  cursor: pointer;
+  transition: box-shadow 0.18s ease;
+}
+
+.gb-book-card:hover {
+  box-shadow: 0 6px 18px rgba(47, 42, 36, 0.12);
+}
+
+.gb-book-card.is-active {
+  border-color: var(--gb-indigo);
+  box-shadow: 0 0 0 2px rgba(58, 74, 107, 0.18);
+}
+
+.gb-muted {
+  color: #8c8479;
+  font-size: 12px;
+}
+
+/* 修复工序时间线 */
+.gb-step-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--gb-line);
+  border-radius: 8px;
+  background: var(--gb-paper-light);
+  margin-bottom: 8px;
+}
+
+.gb-step-row.is-dragging {
+  opacity: 0.5;
+}
+
+.gb-step-row.is-over {
+  border-top: 2px dashed var(--gb-ochre);
+}
+
+.gb-drag-handle {
+  cursor: grab;
+  color: rgba(47, 42, 36, 0.42);
+}
+
+/* 补纸色卡 */
+.gb-paper-swatch {
+  width: 100%;
+  height: 46px;
+  border-radius: 8px;
+  border: 1px solid rgba(47, 42, 36, 0.14);
+}
+
+.gb-paper-card {
+  height: 100%;
+}
+
+.ant-table,
+.el-table {
+  font-variant-numeric: tabular-nums;
+}
