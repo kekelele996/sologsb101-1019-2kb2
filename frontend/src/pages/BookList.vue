@@ -16,6 +16,7 @@ import { useLeafStats } from '@/hooks/useLeafStats'
 import { useBookStore } from '@/stores/bookStore'
 import { useLeafStore } from '@/stores/leafStore'
 import { useRepairStore } from '@/stores/repairStore'
+import { reportConflict } from '@/utils/revision'
 import {
   BOOK_LEVEL_COLOR,
   BOOK_LEVEL_LABEL,
@@ -118,6 +119,11 @@ async function submitBook(): Promise<void> {
 }
 
 async function removeBook(book: Book): Promise<void> {
+  const hasArchived = bookStore.volumesOfBook(book.id).some((volume) => isVolumeLocked(volume.state))
+  if (hasArchived) {
+    ElMessage.warning('该古籍下有已装订归档的册次，不能删除')
+    return
+  }
   try {
     await ElMessageBox.confirm(
       `将同时删除《${book.title}》下的册次、书叶、补纸、工序与装订记录，不可恢复。`,
@@ -136,6 +142,8 @@ const volumeDialog = ref(false)
 const volumeBook = ref<Book | null>(null)
 const editingVolume = ref<Volume | null>(null)
 const volumeForm = reactive<VolumeDraft>(createEmptyVolumeDraft('', 1))
+/** 打开表单时捕获的册次修订号，保存时用于乐观锁比对 */
+const baseRevision = ref(1)
 
 const volumeList = computed(() => (volumeBook.value ? bookStore.volumesOfBook(volumeBook.value.id) : []))
 
@@ -155,11 +163,16 @@ function openEditVolume(volume: Volume): void {
     bindingType: volume.bindingType,
     state: volume.state
   })
+  baseRevision.value = volume.revision
 }
 
 async function submitVolume(): Promise<void> {
   if (editingVolume.value) {
-    await bookStore.updateVolume(editingVolume.value.id, { ...volumeForm })
+    const result = await bookStore.updateVolume(editingVolume.value.id, { ...volumeForm }, baseRevision.value)
+    if (!result.ok) {
+      await reportConflict(result.conflict)
+      return
+    }
     ElMessage.success(`已更新第 ${volumeForm.volumeNo} 册`)
   } else {
     await bookStore.createVolume({ ...volumeForm })
@@ -170,6 +183,10 @@ async function submitVolume(): Promise<void> {
 }
 
 async function removeVolume(volume: Volume): Promise<void> {
+  if (isVolumeLocked(volume.state)) {
+    ElMessage.warning('该册已装订锁定，不能删除')
+    return
+  }
   try {
     await ElMessageBox.confirm(`将删除第 ${volume.volumeNo} 册及其书叶、补纸与工序记录。`, '删除册次', {
       type: 'warning',
@@ -184,7 +201,11 @@ async function removeVolume(volume: Volume): Promise<void> {
 }
 
 async function advanceVolume(volume: Volume): Promise<void> {
-  await bookStore.advanceVolumeState(volume.id)
+  const result = await bookStore.advanceVolumeState(volume.id, volume.revision)
+  if (!result.ok) {
+    await reportConflict(result.conflict)
+    return
+  }
   ElMessage.success(`第 ${volume.volumeNo} 册状态已推进`)
 }
 
@@ -424,9 +445,9 @@ function bindingLabel(value: string): string {
         </el-table-column>
         <el-table-column label="操作" width="240">
           <template #default="{ row }">
-            <el-button size="small" text type="primary" @click="advanceVolume(row)">推进状态</el-button>
+            <el-button size="small" text type="primary" :disabled="isVolumeLocked(row.state)" @click="advanceVolume(row)">推进状态</el-button>
             <el-button size="small" text :disabled="isVolumeLocked(row.state)" @click="openEditVolume(row)">编辑</el-button>
-            <el-button size="small" text type="danger" @click="removeVolume(row)">删除</el-button>
+            <el-button size="small" text type="danger" :disabled="isVolumeLocked(row.state)" @click="removeVolume(row)">删除</el-button>
           </template>
         </el-table-column>
       </el-table>

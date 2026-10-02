@@ -16,6 +16,7 @@ import { useIdbTable } from '@/hooks/useIdbTable'
 import { useLeafStats } from '@/hooks/useLeafStats'
 import { useBookStore } from '@/stores/bookStore'
 import { useLeafStore } from '@/stores/leafStore'
+import { reportConflict } from '@/utils/revision'
 import { PAPER_TYPE_LABEL, type Paper } from '@/types/paper'
 import {
   DAMAGE_TYPE_OPTIONS,
@@ -108,6 +109,12 @@ const editing = ref<Leaf | null>(null)
 const form = reactive<LeafDraft>(createEmptyLeafDraft('', 1))
 const selected = ref<Leaf[]>([])
 const batchState = ref<LeafState>('repaired')
+/** 打开表单时捕获的册次修订号，保存时用于乐观锁比对 */
+const baseRevision = ref(1)
+
+function captureRevision(): void {
+  baseRevision.value = currentVolume.value?.revision ?? 1
+}
 
 function openCreate(): void {
   const volumeId = bookStore.currentVolumeId
@@ -123,6 +130,7 @@ function openCreate(): void {
   const maxLeafNo = existing.reduce((max, leaf) => Math.max(max, leaf.leafNo), 0)
   editing.value = null
   Object.assign(form, createEmptyLeafDraft(volumeId, maxLeafNo + 1))
+  captureRevision()
   dialog.value = true
 }
 
@@ -136,21 +144,34 @@ function openEdit(leaf: Leaf): void {
     phValue: leaf.phValue,
     state: leaf.state
   })
+  captureRevision()
   dialog.value = true
 }
 
 async function submit(): Promise<void> {
   if (editing.value) {
-    await leafStore.updateLeaf(editing.value.id, { ...form })
+    const result = await leafStore.updateLeaf(editing.value.id, { ...form }, baseRevision.value)
+    if (!result.ok) {
+      await reportConflict(result.conflict)
+      return
+    }
     ElMessage.success(`已更新第 ${form.leafNo} 叶破损记录`)
   } else {
-    await leafStore.createLeaf({ ...form })
+    const result = await leafStore.createLeaf({ ...form }, baseRevision.value)
+    if (!result.ok) {
+      await reportConflict(result.conflict)
+      return
+    }
     ElMessage.success(`已登记第 ${form.leafNo} 叶破损记录`)
   }
   dialog.value = false
 }
 
 async function remove(leaf: Leaf): Promise<void> {
+  if (locked.value) {
+    ElMessage.warning('该册已装订锁定，不能删除书叶记录')
+    return
+  }
   try {
     await ElMessageBox.confirm(`将删除第 ${leaf.leafNo} 叶的该条破损记录及其补纸、工序记录。`, '删除书叶记录', {
       type: 'warning',
@@ -160,12 +181,24 @@ async function remove(leaf: Leaf): Promise<void> {
   } catch {
     return
   }
-  await leafStore.removeLeaf(leaf.id)
+  const result = await leafStore.removeLeaf(leaf.id, currentVolume.value?.revision ?? 1)
+  if (!result.ok) {
+    await reportConflict(result.conflict)
+    return
+  }
   ElMessage.success('已删除')
 }
 
 async function advance(leaf: Leaf): Promise<void> {
-  await leafStore.advanceLeafState(leaf.id)
+  if (locked.value) {
+    ElMessage.warning('该册已装订锁定，不能推进书叶状态')
+    return
+  }
+  const result = await leafStore.advanceLeafState(leaf.id, currentVolume.value?.revision ?? 1)
+  if (!result.ok) {
+    await reportConflict(result.conflict)
+    return
+  }
   ElMessage.success(`第 ${leaf.leafNo} 叶状态已推进`)
 }
 
@@ -174,10 +207,19 @@ async function applyBatchState(): Promise<void> {
     ElMessage.warning('请先勾选书叶记录')
     return
   }
-  await leafStore.batchUpdate(
+  if (locked.value) {
+    ElMessage.warning('该册已装订锁定，不能批量改状态')
+    return
+  }
+  const result = await leafStore.batchUpdate(
     selected.value.map((leaf) => leaf.id),
-    { state: batchState.value }
+    { state: batchState.value },
+    currentVolume.value?.revision ?? 1
   )
+  if (!result.ok) {
+    await reportConflict(result.conflict)
+    return
+  }
   ElMessage.success(`已批量改为${LEAF_STATE_LABEL[batchState.value]}`)
   selected.value = []
 }
@@ -187,8 +229,13 @@ function handleSelectionChange(list: Leaf[]): void {
 }
 
 async function addLeafRecord(leaf: Leaf): Promise<void> {
+  if (locked.value) {
+    ElMessage.warning('该册已装订锁定，不能叠加破损记录')
+    return
+  }
   editing.value = null
   Object.assign(form, createEmptyLeafDraft(leaf.volumeId, leaf.leafNo))
+  captureRevision()
   dialog.value = true
   ElMessage.info(`同一叶号可叠加多种破损：已带出第 ${leaf.leafNo} 叶`)
 }
@@ -284,7 +331,7 @@ function stateColor(state: string): string {
           <el-select v-model="batchState" size="small" style="width: 110px">
             <el-option v-for="item in LEAF_STATE_OPTIONS" :key="item.value" :label="item.label" :value="item.value" />
           </el-select>
-          <el-button size="small" :disabled="selected.length === 0" @click="applyBatchState">
+          <el-button size="small" :disabled="selected.length === 0 || locked" @click="applyBatchState">
             批量改状态（{{ selected.length }}）
           </el-button>
         </template>
@@ -343,10 +390,10 @@ function stateColor(state: string): string {
           </el-table-column>
           <el-table-column label="操作" min-width="260">
             <template #default="{ row }">
-              <el-button size="small" text type="primary" @click="advance(row)">推进状态</el-button>
-              <el-button size="small" text @click="addLeafRecord(row)">叠加破损</el-button>
+              <el-button size="small" text type="primary" :disabled="locked" @click="advance(row)">推进状态</el-button>
+              <el-button size="small" text :disabled="locked" @click="addLeafRecord(row)">叠加破损</el-button>
               <el-button size="small" text :disabled="locked" :icon="Edit" @click="openEdit(row)">编辑</el-button>
-              <el-button size="small" text type="danger" :icon="Delete" @click="remove(row)">删除</el-button>
+              <el-button size="small" text type="danger" :disabled="locked" :icon="Delete" @click="remove(row)">删除</el-button>
             </template>
           </el-table-column>
         </el-table>

@@ -4,7 +4,10 @@
  */
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
-import { createId, db, removeLeafCascade } from '@/utils/db'
+import { createId, db } from '@/utils/db'
+import { withVolumeRevision, type RevisionResult } from '@/utils/revision'
+import type { Paper } from '@/types/paper'
+import type { RepairOrder } from '@/types/repairOrder'
 import {
   nextLeafState,
   type DamageType,
@@ -98,38 +101,108 @@ export const useLeafStore = defineStore('leaf', () => {
     filters.value = { ...DEFAULT_LEAF_FILTERS }
   }
 
-  async function createLeaf(draft: LeafDraft): Promise<Leaf> {
+  async function createLeaf(draft: LeafDraft, baseRevision: number): Promise<RevisionResult<Leaf>> {
     const now = Date.now()
     const row: Leaf = { ...draft, id: createId('leaf'), createdAt: now, updatedAt: now }
-    await db.leaves.put(row)
-    await loadLeaves()
-    return row
+    const result = await withVolumeRevision(draft.volumeId, baseRevision, async (tx) => {
+      await tx.table<Leaf>('leaves').put(row)
+      return {
+        data: row,
+        changes: [
+          {
+            action: 'create',
+            table: 'leaves',
+            recordId: row.id,
+            label: `第 ${row.leafNo} 叶破损记录`
+          }
+        ]
+      }
+    })
+    if (result.ok) await loadLeaves()
+    return result
   }
 
-  async function updateLeaf(id: string, patch: Partial<Leaf>): Promise<void> {
-    await db.leaves.update(id, { ...patch, updatedAt: Date.now() } as never)
-    await loadLeaves()
-  }
-
-  async function removeLeaf(id: string): Promise<void> {
-    await removeLeafCascade(id)
-    await loadLeaves()
-  }
-
-  async function batchUpdate(ids: string[], patch: Partial<Leaf>): Promise<void> {
-    if (ids.length === 0) return
-    const now = Date.now()
-    const rows = leaves.value.filter((leaf) => ids.includes(leaf.id)).map((leaf) => ({ ...leaf, ...patch, updatedAt: now }))
-    await db.leaves.bulkPut(rows)
-    await loadLeaves()
-  }
-
-  async function advanceLeafState(id: string): Promise<void> {
+  async function updateLeaf(id: string, patch: Partial<Leaf>, baseRevision: number): Promise<RevisionResult<void>> {
     const leaf = leaves.value.find((item) => item.id === id)
-    if (!leaf) return
+    if (!leaf) return { ok: true, revision: baseRevision, data: undefined }
+    const result = await withVolumeRevision(leaf.volumeId, baseRevision, async (tx) => {
+      const leavesTable = tx.table<Leaf>('leaves')
+      await leavesTable.update(id, { ...patch, updatedAt: Date.now() })
+      const updated = await leavesTable.get(id)
+      return {
+        data: undefined,
+        changes: [
+          {
+            action: 'update',
+            table: 'leaves',
+            recordId: id,
+            label: `第 ${updated?.leafNo ?? leaf.leafNo} 叶破损记录`
+          }
+        ]
+      }
+    })
+    if (result.ok) await loadLeaves()
+    return result
+  }
+
+  async function removeLeaf(id: string, baseRevision: number): Promise<RevisionResult<void>> {
+    const leaf = leaves.value.find((item) => item.id === id)
+    if (!leaf) return { ok: true, revision: baseRevision, data: undefined }
+    const result = await withVolumeRevision(leaf.volumeId, baseRevision, async (tx) => {
+      const leavesTable = tx.table<Leaf>('leaves')
+      const papersTable = tx.table<Paper>('papers')
+      const repairOrdersTable = tx.table<RepairOrder>('repairOrders')
+      // 级联删除该叶下的补纸与工序记录
+      const paperIds = await papersTable.where('leafId').equals(id).primaryKeys()
+      const orderIds = await repairOrdersTable.where('leafId').equals(id).primaryKeys()
+      if (paperIds.length > 0) await papersTable.bulkDelete(paperIds)
+      if (orderIds.length > 0) await repairOrdersTable.bulkDelete(orderIds)
+      await leavesTable.delete(id)
+      return {
+        data: undefined,
+        changes: [
+          {
+            action: 'delete',
+            table: 'leaves',
+            recordId: id,
+            label: `第 ${leaf.leafNo} 叶破损记录`
+          }
+        ]
+      }
+    })
+    if (result.ok) await loadLeaves()
+    return result
+  }
+
+  async function batchUpdate(ids: string[], patch: Partial<Leaf>, baseRevision: number): Promise<RevisionResult<void>> {
+    if (ids.length === 0) return { ok: true, revision: baseRevision, data: undefined }
+    const selected = leaves.value.filter((leaf) => ids.includes(leaf.id))
+    if (selected.length === 0) return { ok: true, revision: baseRevision, data: undefined }
+    const volumeId = selected[0].volumeId
+    const now = Date.now()
+    const result = await withVolumeRevision(volumeId, baseRevision, async (tx) => {
+      const rows = selected.map((leaf) => ({ ...leaf, ...patch, updatedAt: now }))
+      await tx.table<Leaf>('leaves').bulkPut(rows)
+      return {
+        data: undefined,
+        changes: selected.map((leaf) => ({
+          action: 'update' as const,
+          table: 'leaves' as const,
+          recordId: leaf.id,
+          label: `第 ${leaf.leafNo} 叶破损记录`
+        }))
+      }
+    })
+    if (result.ok) await loadLeaves()
+    return result
+  }
+
+  async function advanceLeafState(id: string, baseRevision: number): Promise<RevisionResult<void>> {
+    const leaf = leaves.value.find((item) => item.id === id)
+    if (!leaf) return { ok: true, revision: baseRevision, data: undefined }
     const next = nextLeafState(leaf.state)
-    if (next === leaf.state) return
-    await updateLeaf(id, { state: next })
+    if (next === leaf.state) return { ok: true, revision: baseRevision, data: undefined }
+    return updateLeaf(id, { state: next }, baseRevision)
   }
 
   function leafById(id: string): Leaf | undefined {

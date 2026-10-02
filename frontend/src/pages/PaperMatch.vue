@@ -14,6 +14,7 @@ import StatBadge from '@/components/common/StatBadge.vue'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { useBookStore } from '@/stores/bookStore'
 import { useLeafStore } from '@/stores/leafStore'
+import { reportConflict } from '@/utils/revision'
 import {
   DEFAULT_DYE_RECIPE,
   DELTA_E_THRESHOLD,
@@ -27,6 +28,7 @@ import {
   type PaperType
 } from '@/types/paper'
 import { DAMAGE_TYPE_LABEL } from '@/types/leaf'
+import { isVolumeLocked } from '@/types/volume'
 import {
   PAPER_BASE_COLOR,
   candidateScore,
@@ -38,7 +40,19 @@ import {
 
 const bookStore = useBookStore()
 const leafStore = useLeafStore()
-const paperTable = useIdbTable<Paper>((database) => database.papers, { sortByUpdatedAt: false })
+const paperTable = useIdbTable<Paper>((database) => database.papers, {
+  sortByUpdatedAt: false,
+  revisionScope: {
+    getVolumeId: (paper) => {
+      const leaf = leafStore.leafById(paper.leafId)
+      return leaf?.volumeId ?? null
+    },
+    getLabel: (paper) => {
+      const leaf = leafStore.leafById(paper.leafId)
+      return `第 ${leaf?.leafNo ?? '?'} 叶补纸记录`
+    }
+  }
+})
 
 const FILTER_KEYS = ['paperType', 'laidPattern'] as const
 const url = useFilterQuery(FILTER_KEYS)
@@ -134,14 +148,39 @@ const leafOptions = computed(() =>
   )
 )
 
+/** 当前表单所选书叶的册次（用于锁定判断与修订号捕获） */
+const formVolume = computed(() => {
+  if (!form.leafId) return undefined
+  const leaf = leafStore.leafById(form.leafId)
+  if (!leaf) return undefined
+  return bookStore.volumeById(leaf.volumeId)
+})
+const locked = computed(() => (formVolume.value ? isVolumeLocked(formVolume.value.state) : false))
+
+/** 打开表单时捕获的册次修订号，保存时用于乐观锁比对 */
+const baseRevision = ref(1)
+
+function captureRevision(): void {
+  baseRevision.value = formVolume.value?.revision ?? 1
+}
+
 function openCreate(): void {
   const firstLeaf = leafOptions.value[0]
   if (!firstLeaf) {
     ElMessage.warning('请先登记书叶')
     return
   }
+  const leaf = leafStore.leafById(firstLeaf.value)
+  if (leaf) {
+    const volume = bookStore.volumeById(leaf.volumeId)
+    if (volume && isVolumeLocked(volume.state)) {
+      ElMessage.warning('该册已装订锁定，不能新增补纸记录')
+      return
+    }
+  }
   editing.value = null
   Object.assign(form, createEmptyPaperDraft(firstLeaf.value))
+  captureRevision()
   dialog.value = true
 }
 
@@ -155,6 +194,7 @@ function openEdit(paper: Paper): void {
     deltaE: paper.deltaE,
     dyeRecipe: paper.dyeRecipe
   })
+  captureRevision()
   dialog.value = true
 }
 
@@ -177,17 +217,33 @@ async function submit(): Promise<void> {
     ElMessage.warning('请选择关联书叶')
     return
   }
+  if (locked.value) {
+    ElMessage.warning('该册已装订锁定，不能保存补纸记录')
+    return
+  }
   if (editing.value) {
-    await paperTable.update(editing.value.id, { ...form })
+    const result = await paperTable.update(editing.value.id, { ...form }, baseRevision.value)
+    if (!result.ok) {
+      await reportConflict(result.conflict)
+      return
+    }
     ElMessage.success('已更新补纸记录')
   } else {
-    await paperTable.create({ ...form }, 'paper')
+    const result = await paperTable.create({ ...form }, 'paper', baseRevision.value)
+    if (!result.ok) {
+      await reportConflict(result.conflict)
+      return
+    }
     ElMessage.success(needRedye(form.deltaE) ? '已新增补纸，色差超阈值需重新染色' : '已新增补纸记录')
   }
   dialog.value = false
 }
 
 async function remove(paper: Paper): Promise<void> {
+  if (locked.value) {
+    ElMessage.warning('该册已装订锁定，不能删除补纸记录')
+    return
+  }
   try {
     await ElMessageBox.confirm('将删除该补纸选配记录。', '删除补纸', {
       type: 'warning',
@@ -197,7 +253,11 @@ async function remove(paper: Paper): Promise<void> {
   } catch {
     return
   }
-  await paperTable.remove(paper.id)
+  const result = await paperTable.remove(paper.id, baseRevision.value)
+  if (!result.ok) {
+    await reportConflict(result.conflict)
+    return
+  }
   ElMessage.success('已删除')
 }
 
@@ -234,6 +294,13 @@ const candidateLeafPattern = computed(() =>
 
 async function selectCandidate(type: PaperType, deltaE: number, laidPatternValue: string, thicknessMm: number): Promise<void> {
   if (!candidateLeafId.value) return
+  const candidateLeaf = leafStore.leafById(candidateLeafId.value)
+  const candidateVolume = candidateLeaf ? bookStore.volumeById(candidateLeaf.volumeId) : undefined
+  if (candidateVolume && isVolumeLocked(candidateVolume.state)) {
+    ElMessage.warning('该册已装订锁定，不能采用候选补纸')
+    return
+  }
+  const candidateRevision = candidateVolume?.revision ?? 1
   const existing = paperTable.rows.value.find(
     (item) => item.leafId === candidateLeafId.value && item.paperType === type
   )
@@ -246,16 +313,32 @@ async function selectCandidate(type: PaperType, deltaE: number, laidPatternValue
     dyeRecipe: DEFAULT_DYE_RECIPE[type]
   }
   if (existing) {
-    await paperTable.update(existing.id, payload)
+    const result = await paperTable.update(existing.id, payload, candidateRevision)
+    if (!result.ok) {
+      await reportConflict(result.conflict)
+      return
+    }
     ElMessage.success(`已更新${PAPER_TYPE_LABEL[type]}候选`)
   } else {
-    await paperTable.create(payload, 'paper')
+    const result = await paperTable.create(payload, 'paper', candidateRevision)
+    if (!result.ok) {
+      await reportConflict(result.conflict)
+      return
+    }
     ElMessage.success(`已采用${PAPER_TYPE_LABEL[type]}候选补纸`)
   }
 }
 
 function deltaTag(deltaE: number): { label: string; color: string } {
   return deltaELevel(deltaE)
+}
+
+/** 判断某条补纸记录所属册次是否已锁定 */
+function isPaperLocked(paper: Paper): boolean {
+  const leaf = leafStore.leafById(paper.leafId)
+  if (!leaf) return false
+  const volume = bookStore.volumeById(leaf.volumeId)
+  return volume ? isVolumeLocked(volume.state) : false
 }
 </script>
 
@@ -349,8 +432,8 @@ function deltaTag(deltaE: number): { label: string; color: string } {
             </el-table-column>
             <el-table-column label="操作" width="150">
               <template #default="{ row }">
-                <el-button size="small" text :icon="Edit" @click="openEdit(row)">编辑</el-button>
-                <el-button size="small" text type="danger" :icon="Delete" @click="remove(row)">删除</el-button>
+                <el-button size="small" text :disabled="isPaperLocked(row)" :icon="Edit" @click="openEdit(row)">编辑</el-button>
+                <el-button size="small" text type="danger" :disabled="isPaperLocked(row)" :icon="Delete" @click="remove(row)">删除</el-button>
               </template>
             </el-table-column>
           </el-table>

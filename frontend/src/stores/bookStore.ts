@@ -13,7 +13,9 @@ import {
   removeVolumeCascade,
   writeUiPrefs
 } from '@/utils/db'
+import { withVolumeRevision, type RevisionResult } from '@/utils/revision'
 import type { Book, BookDraft, BookLevel } from '@/types/book'
+import type { Binding, BindingVerdict } from '@/types/binding'
 import {
   nextVolumeState,
   type Volume,
@@ -140,18 +142,38 @@ export const useBookStore = defineStore('book', () => {
 
   async function createVolume(draft: VolumeDraft): Promise<Volume> {
     const now = Date.now()
-    const row: Volume = { ...draft, id: createId('vol'), createdAt: now, updatedAt: now }
+    const row: Volume = { ...draft, id: createId('vol'), revision: 1, createdAt: now, updatedAt: now }
     await db.volumes.put(row)
     await loadVolumes()
     await syncBookVolumeCount(row.bookId)
     return row
   }
 
-  async function updateVolume(id: string, patch: Partial<Volume>): Promise<void> {
+  /**
+   * 更新册次（带修订号乐观锁）。
+   * @param baseRevision 保存方看到的修订号
+   */
+  async function updateVolume(id: string, patch: Partial<Volume>, baseRevision: number): Promise<RevisionResult<void>> {
     const existing = volumes.value.find((volume) => volume.id === id)
-    await db.volumes.update(id, { ...patch, updatedAt: Date.now() } as never)
-    await loadVolumes()
-    if (existing) await syncBookVolumeCount(existing.bookId)
+    const result = await withVolumeRevision(id, baseRevision, async (tx) => {
+      await tx.table<Volume>('volumes').update(id, { ...patch, updatedAt: Date.now() })
+      return {
+        data: undefined,
+        changes: [
+          {
+            action: 'update',
+            table: 'volumes',
+            recordId: id,
+            label: `第 ${existing?.volumeNo ?? '?'} 册册次信息`
+          }
+        ]
+      }
+    })
+    if (result.ok) {
+      await loadVolumes()
+      if (existing) await syncBookVolumeCount(existing.bookId)
+    }
+    return result
   }
 
   async function removeVolume(id: string): Promise<void> {
@@ -172,12 +194,73 @@ export const useBookStore = defineStore('book', () => {
     }
   }
 
-  async function advanceVolumeState(id: string): Promise<void> {
+  /** 推进册次状态（带修订号乐观锁） */
+  async function advanceVolumeState(id: string, baseRevision: number): Promise<RevisionResult<void>> {
     const volume = volumes.value.find((item) => item.id === id)
-    if (!volume) return
+    if (!volume) return { ok: true, revision: baseRevision, data: undefined }
     const next: VolumeState = nextVolumeState(volume.state)
-    if (next === volume.state) return
-    await updateVolume(id, { state: next })
+    if (next === volume.state) return { ok: true, revision: baseRevision, data: undefined }
+    return updateVolume(id, { state: next }, baseRevision)
+  }
+
+  /**
+   * 装订验收提交（带修订号乐观锁）。
+   * 在同一事务中完成：① 新建/更新装订验收记录；② 按结论更新册次状态（合格→已归档，返修→修复中）。
+   * 两步合并为一次修订号自增，避免中间状态被其他窗口误改。
+   */
+  async function submitAcceptance(
+    volumeId: string,
+    bindingData: { id?: string; method: string; finishDate: string; verdict: BindingVerdict; inspector: string },
+    baseRevision: number
+  ): Promise<RevisionResult<void>> {
+    const volume = volumes.value.find((item) => item.id === volumeId)
+    if (!volume) return { ok: true, revision: baseRevision, data: undefined }
+    const result = await withVolumeRevision(volumeId, baseRevision, async (tx) => {
+      const now = Date.now()
+      const bindingsTable = tx.table<Binding>('bindings')
+      const volumesTable = tx.table<Volume>('volumes')
+      if (bindingData.id) {
+        await bindingsTable.update(bindingData.id, {
+          method: bindingData.method,
+          finishDate: bindingData.finishDate,
+          verdict: bindingData.verdict,
+          inspector: bindingData.inspector,
+          updatedAt: now
+        })
+      } else {
+        await bindingsTable.put({
+          id: createId('bind'),
+          volumeId,
+          method: bindingData.method,
+          finishDate: bindingData.finishDate,
+          verdict: bindingData.verdict,
+          inspector: bindingData.inspector,
+          createdAt: now,
+          updatedAt: now
+        })
+      }
+      const newState: VolumeState = bindingData.verdict === 'pass' ? 'archived' : 'repairing'
+      await volumesTable.update(volumeId, { state: newState, updatedAt: now })
+      return {
+        data: undefined,
+        changes: [
+          {
+            action: bindingData.id ? ('update' as const) : ('create' as const),
+            table: 'bindings' as const,
+            recordId: bindingData.id ?? 'new',
+            label: '装订验收记录'
+          },
+          {
+            action: 'update' as const,
+            table: 'volumes' as const,
+            recordId: volumeId,
+            label: `册次状态（${newState === 'archived' ? '已归档' : '退回修复中'}）`
+          }
+        ]
+      }
+    })
+    if (result.ok) await loadVolumes()
+    return result
   }
 
   function volumesOfBook(bookId: string): Volume[] {
@@ -220,6 +303,7 @@ export const useBookStore = defineStore('book', () => {
     updateVolume,
     removeVolume,
     advanceVolumeState,
+    submitAcceptance,
     volumesOfBook,
     bookById,
     volumeById

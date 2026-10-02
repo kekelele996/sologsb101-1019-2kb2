@@ -15,7 +15,9 @@ import { useIdbTable } from '@/hooks/useIdbTable'
 import { useBookStore } from '@/stores/bookStore'
 import { useLeafStore } from '@/stores/leafStore'
 import { useRepairStore } from '@/stores/repairStore'
+import { reportConflict } from '@/utils/revision'
 import { DAMAGE_TYPE_LABEL } from '@/types/leaf'
+import { isVolumeLocked } from '@/types/volume'
 import {
   ORDER_STATE_COLOR,
   ORDER_STATE_LABEL,
@@ -63,6 +65,11 @@ watch(
 )
 
 const currentLeaf = computed(() => (currentLeafId.value ? leafStore.leafById(currentLeafId.value) : undefined))
+const currentVolume = computed(() => {
+  if (!currentLeaf.value) return undefined
+  return bookStore.volumeById(currentLeaf.value.volumeId)
+})
+const locked = computed(() => (currentVolume.value ? isVolumeLocked(currentVolume.value.state) : false))
 const currentPaper = computed(() =>
   currentLeafId.value ? paperTable.rows.value.find((paper) => paper.leafId === currentLeafId.value) : undefined
 )
@@ -129,18 +136,33 @@ const form = reactive<RepairOrderDraft>(createEmptyOrderDraft('', 1))
 const selectedIds = ref<string[]>([])
 const dragId = ref('')
 const overId = ref('')
+/** 打开表单时捕获的册次修订号，保存时用于乐观锁比对 */
+const baseRevision = ref(1)
+
+function captureRevision(): void {
+  baseRevision.value = currentVolume.value?.revision ?? 1
+}
 
 function openCreate(): void {
   if (!currentLeafId.value) {
     ElMessage.warning('请先选择书叶')
     return
   }
+  if (locked.value) {
+    ElMessage.warning('该册已装订锁定，不能新增工序')
+    return
+  }
   editing.value = null
   Object.assign(form, createEmptyOrderDraft(currentLeafId.value, repairStore.nextSeq(currentLeafId.value)))
+  captureRevision()
   dialog.value = true
 }
 
 function openEdit(order: RepairOrder): void {
+  if (locked.value) {
+    ElMessage.warning('该册已装订锁定，不能编辑工序')
+    return
+  }
   editing.value = order
   Object.assign(form, {
     leafId: order.leafId,
@@ -151,6 +173,7 @@ function openEdit(order: RepairOrder): void {
     date: order.date,
     state: order.state
   })
+  captureRevision()
   dialog.value = true
 }
 
@@ -165,16 +188,28 @@ watch(
 
 async function submit(): Promise<void> {
   if (editing.value) {
-    await repairStore.updateOrder(editing.value.id, { ...form })
+    const result = await repairStore.updateOrder(editing.value.id, { ...form }, baseRevision.value)
+    if (!result.ok) {
+      await reportConflict(result.conflict)
+      return
+    }
     ElMessage.success('已更新工序')
   } else {
-    await repairStore.createOrder({ ...form })
+    const result = await repairStore.createOrder({ ...form }, baseRevision.value)
+    if (!result.ok) {
+      await reportConflict(result.conflict)
+      return
+    }
     ElMessage.success(`已新增第 ${form.seq} 道工序`)
   }
   dialog.value = false
 }
 
 async function remove(order: RepairOrder): Promise<void> {
+  if (locked.value) {
+    ElMessage.warning('该册已装订锁定，不能删除工序')
+    return
+  }
   try {
     await ElMessageBox.confirm('删除后其余工序会自动重编号。', '删除工序', {
       type: 'warning',
@@ -184,18 +219,31 @@ async function remove(order: RepairOrder): Promise<void> {
   } catch {
     return
   }
-  await repairStore.removeOrder(order.id)
+  const result = await repairStore.removeOrder(order.id, currentVolume.value?.revision ?? 1)
+  if (!result.ok) {
+    await reportConflict(result.conflict)
+    return
+  }
   ElMessage.success('已删除')
 }
 
 async function advance(order: RepairOrder): Promise<void> {
+  if (locked.value) {
+    ElMessage.warning('该册已装订锁定，不能推进工序状态')
+    return
+  }
   const list = repairStore.ordersOfLeaf(order.leafId)
   const previous = list.find((item) => item.seq === order.seq - 1)
   if (previous && previous.state !== 'done') {
     ElMessage.warning(`第 ${previous.seq} 道「${REPAIR_NAME_LABEL[previous.name]}」尚未完成，禁止推进`)
     return
   }
-  const next = await repairStore.advanceOrder(order.id)
+  const result = await repairStore.advanceOrder(order.id, currentVolume.value?.revision ?? 1)
+  if (!result.ok) {
+    await reportConflict(result.conflict)
+    return
+  }
+  const next = result.data
   ElMessage.success(`已置为「${ORDER_STATE_LABEL[next]}」${next === 'done' ? '，并回写书叶状态' : ''}`)
 }
 
@@ -204,7 +252,16 @@ async function generate(): Promise<void> {
     ElMessage.warning('请先选择书叶')
     return
   }
-  const created = await repairStore.generateSequence(currentLeafId.value)
+  if (locked.value) {
+    ElMessage.warning('该册已装订锁定，不能生成工序序列')
+    return
+  }
+  const result = await repairStore.generateSequence(currentLeafId.value, currentVolume.value?.revision ?? 1)
+  if (!result.ok) {
+    await reportConflict(result.conflict)
+    return
+  }
+  const created = result.data
   if (created === 0) {
     ElMessage.info('该叶已有完整工序序列')
   } else {
@@ -217,7 +274,19 @@ async function batchComplete(): Promise<void> {
     ElMessage.warning('请先勾选工序')
     return
   }
-  await repairStore.batchUpdate(selectedIds.value, { state: 'done' })
+  if (locked.value) {
+    ElMessage.warning('该册已装订锁定，不能批量完成工序')
+    return
+  }
+  const result = await repairStore.batchUpdate(
+    selectedIds.value,
+    { state: 'done' },
+    currentVolume.value?.revision ?? 1
+  )
+  if (!result.ok) {
+    await reportConflict(result.conflict)
+    return
+  }
   ElMessage.success(`已批量完成 ${selectedIds.value.length} 道工序`)
   selectedIds.value = []
 }
@@ -227,13 +296,21 @@ async function drop(targetId: string): Promise<void> {
   overId.value = ''
   dragId.value = ''
   if (!from || from === targetId || !currentLeafId.value) return
+  if (locked.value) {
+    ElMessage.warning('该册已装订锁定，不能拖拽排序工序')
+    return
+  }
   const ids = repairStore.ordersOfLeaf(currentLeafId.value).map((order) => order.id)
   const fromIndex = ids.indexOf(from)
   const toIndex = ids.indexOf(targetId)
   if (fromIndex < 0 || toIndex < 0) return
   const [moved] = ids.splice(fromIndex, 1)
   ids.splice(toIndex, 0, moved as string)
-  await repairStore.reorderOrders(currentLeafId.value, ids)
+  const result = await repairStore.reorderOrders(currentLeafId.value, ids, currentVolume.value?.revision ?? 1)
+  if (!result.ok) {
+    await reportConflict(result.conflict)
+    return
+  }
   ElMessage.success('工序顺序已更新并重编号')
 }
 
@@ -269,8 +346,8 @@ watchEffect(() => {
         <el-select v-model="currentLeafId" filterable placeholder="选择书叶" style="width: 320px">
           <el-option v-for="item in leafOptions" :key="item.value" :label="item.label" :value="item.value" />
         </el-select>
-        <el-button :icon="Plus" @click="generate">生成标准序列</el-button>
-        <el-button type="primary" :icon="Plus" @click="openCreate">新增工序</el-button>
+        <el-button :icon="Plus" :disabled="locked" @click="generate">生成标准序列</el-button>
+        <el-button type="primary" :icon="Plus" :disabled="locked" @click="openCreate">新增工序</el-button>
       </div>
     </div>
 
@@ -303,7 +380,7 @@ watchEffect(() => {
       @reset="url.reset()"
     >
       <template #actions>
-        <el-button size="small" :disabled="selectedIds.length === 0" :icon="Check" @click="batchComplete">
+        <el-button size="small" :disabled="selectedIds.length === 0 || locked" :icon="Check" @click="batchComplete">
           批量完成（{{ selectedIds.length }}）
         </el-button>
       </template>
@@ -334,11 +411,12 @@ watchEffect(() => {
           @dragover.prevent="overId = order.id"
           @drop="drop(order.id)"
         >
-          <el-icon class="gb-drag-handle" draggable="true" @dragstart="dragId = order.id" @dragend="dragId = ''">
+          <el-icon class="gb-drag-handle" :class="{ 'is-disabled': locked }" :draggable="!locked" @dragstart="dragId = order.id" @dragend="dragId = ''">
             <Rank />
           </el-icon>
           <el-checkbox
             :model-value="selectedIds.includes(order.id)"
+            :disabled="locked"
             @update:model-value="() => toggleSelect(order.id)"
           />
           <el-tag effect="plain" round>第 {{ order.seq }} 道</el-tag>
@@ -349,9 +427,9 @@ watchEffect(() => {
           <span class="gb-muted">{{ order.material || '未填材料' }}</span>
           <span class="gb-muted">{{ order.operator || '未填操作人' }} · {{ order.date }}</span>
           <div style="margin-left: auto; display: flex; gap: 4px">
-            <el-button size="small" text type="primary" @click="advance(order)">推进状态</el-button>
-            <el-button size="small" text :icon="Edit" @click="openEdit(order)">编辑</el-button>
-            <el-button size="small" text type="danger" :icon="Delete" @click="remove(order)">删除</el-button>
+            <el-button size="small" text type="primary" :disabled="locked" @click="advance(order)">推进状态</el-button>
+            <el-button size="small" text :disabled="locked" :icon="Edit" @click="openEdit(order)">编辑</el-button>
+            <el-button size="small" text type="danger" :disabled="locked" :icon="Delete" @click="remove(order)">删除</el-button>
           </div>
         </div>
 

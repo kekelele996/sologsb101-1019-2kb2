@@ -21,11 +21,13 @@ export interface Volume {
   bindingType: BindingType;
   /** 当前状态 */
   state: VolumeState;
+  /** 修订号：每次册内数据变更递增，用于乐观锁并发控制 */
+  revision: number;
   createdAt: number;
   updatedAt: number;
 }
 
-export type VolumeDraft = Omit<Volume, 'id' | 'createdAt' | 'updatedAt'>;
+export type VolumeDraft = Omit<Volume, 'id' | 'createdAt' | 'updatedAt' | 'revision'>;
 
 export const BINDING_TYPE_LABEL: Record<BindingType, string> = {
   thread: '线装',

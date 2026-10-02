@@ -82,13 +82,27 @@ npm run preview    # 本地预览构建产物（http://localhost:22819）
 | 模型 | 文件 | 关键字段 | 说明 |
 | --- | --- | --- | --- |
 | Book 古籍 | `src/types/book.ts` | `id` `title` `edition` `era` `volumeCount` `collectionNo` `level`（一级/二级/三级/普通） | 新建后进入册次登记，卡片回显待修叶数与已完成工序数 |
-| Volume 册次 | `src/types/volume.ts` | `id` `bookId` `volumeNo` `leafCount` `bindingType`（线装/蝴蝶装/包背装） `state`（待修复/修复中/已装订/已归档） | 装订完成后整册锁定为只读 |
+| Volume 册次 | `src/types/volume.ts` | `id` `bookId` `volumeNo` `leafCount` `bindingType`（线装/蝴蝶装/包背装） `state`（待修复/修复中/已装订/已归档） `revision`（修订号） | 装订完成后整册锁定为只读；修订号用于并发乐观锁，保存时比对版本，冲突则报告对方改了哪几条而不覆盖 |
 | Leaf 书叶 | `src/types/leaf.ts` | `id` `volumeId` `leafNo` `damageType`（虫蛀/酸化/絮化/缺肉/水渍） `damageAreaCm2` `phValue` `state`（待修/修复中/已修复） | 同叶可叠加多种破损，按册汇总面积与平均 pH |
 | Paper 补纸 | `src/types/paper.ts` | `id` `leafId` `paperType`（竹纸/皮纸/宣纸） `laidPattern` `thicknessMm` `deltaE` `dyeRecipe` | 按色差排序候选，ΔE 超阈值提示重新染色 |
 | RepairOrder 修复工序 | `src/types/repairOrder.ts` | `id` `leafId` `seq` `name`（补破/托裱/溜口/裁齐/压平） `material` `operator` `date` `state`（未开始/进行中/已完成） | 拖拽调序，完成即回写书叶状态 |
 | Binding 装订 | `src/types/binding.ts` | `id` `volumeId` `method` `finishDate` `verdict`（合格/返修） `inspector` | 合格触发全册归档，返修退回修复中 |
 
-数据结构版本号 `DB_VERSION` 定义在 `src/utils/db.ts`，当前为 `v2`：`papers` 表增加 `dyeRecipe` 字段，并在 Dexie `.upgrade()` 中按纸种回填默认染色配方（竹纸 / 皮纸 / 宣纸 各有基准配方）。
+数据结构版本号 `DB_VERSION` 定义在 `src/utils/db.ts`，当前为 `v3`：
+- `v1 → v2`：`papers` 表增加 `dyeRecipe` 字段，并在 Dexie `.upgrade()` 中按纸种回填默认染色配方（竹纸 / 皮纸 / 宣纸 各有基准配方）。
+- `v2 → v3`：`volumes` 表增加 `revision` 修订号字段，并新增 `volumeChanges` 变更日志表（按册记录每次改动，供并发冲突时回放「哪几条已被更新」）。升级时对缺修订号的册按归档状态补齐：已归档册 `revision = 2`，其余 `revision = 1`。
+
+### 并发乐观锁（修订号机制）
+
+修复室常开两个窗口并发做同一部书：一个窗口登记书叶破损和补纸，另一个窗口排修复工序。为避免后保存的窗口盖掉对方刚填的内容，每册（Volume）带有修订号 `revision`：
+
+1. **捕获版本**：打开编辑表单时，捕获当前册次的修订号作为 `baseRevision`。
+2. **保存比对**：保存时在事务中比对册次当前修订号与 `baseRevision`。
+   - 一致 → 执行写入，记录变更日志，修订号 +1。
+   - 不一致 → 返回冲突信息，**不覆盖对方结果**，并列出对方在 `(baseRevision, 当前修订号]` 区间内做的改动。
+3. **归档锁定**：册次归档后整册锁定为只读，普通编辑（书叶 / 补纸 / 工序 / 册次信息）一律禁止；仅验收人可在 `/export` 页通过「验收返修」将册次退回修复中。
+
+冲突提示文案由 `src/utils/revision.ts` 的 `formatConflictMessage()` 生成，列出对方更新的条目与动作（新增 / 修改 / 删除）。
 
 ---
 
@@ -104,7 +118,7 @@ sologsb101-1019/
 │   │   ├── hooks/                # useLeafStats.ts useIdbTable.ts
 │   │   ├── pages/                # BookList.vue LeafBoard.vue PaperMatch.vue RepairWorkflow.vue ExportView.vue
 │   │   ├── router/               # index.ts
-│   │   ├── utils/                # paperColor.ts db.ts export.ts
+│   │   ├── utils/                # paperColor.ts db.ts export.ts revision.ts
 │   │   ├── styles/               # main.css
 │   │   ├── App.vue main.ts env.d.ts
 │   ├── public/favicon.svg
