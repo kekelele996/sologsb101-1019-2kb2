@@ -15,11 +15,13 @@ import {
 } from '@/utils/db'
 import type { Book, BookDraft, BookLevel } from '@/types/book'
 import {
+  isVolumeContentEditable,
   nextVolumeState,
   type Volume,
   type VolumeDraft,
   type VolumeState
 } from '@/types/volume'
+import { commitVolumeChange, revisionOf, type VolumeSaveResult } from '@/utils/concurrency'
 
 export interface BookFilters {
   keyword: string
@@ -133,6 +135,10 @@ export const useBookStore = defineStore('book', () => {
   }
 
   async function removeBook(id: string): Promise<void> {
+    const lockedVolume = volumes.value.find((volume) => volume.bookId === id && !isVolumeContentEditable(volume.state))
+    if (lockedVolume) {
+      throw new Error('该古籍下已有装订或归档册次，不能删除')
+    }
     await removeBookCascade(id)
     if (currentBookId.value === id) currentBookId.value = null
     await Promise.all([loadBooks(), loadVolumes()])
@@ -140,22 +146,39 @@ export const useBookStore = defineStore('book', () => {
 
   async function createVolume(draft: VolumeDraft): Promise<Volume> {
     const now = Date.now()
-    const row: Volume = { ...draft, id: createId('vol'), createdAt: now, updatedAt: now }
+    const row: Volume = { ...draft, id: createId('vol'), revision: 0, createdAt: now, updatedAt: now }
     await db.volumes.put(row)
     await loadVolumes()
     await syncBookVolumeCount(row.bookId)
     return row
   }
 
-  async function updateVolume(id: string, patch: Partial<Volume>): Promise<void> {
+  async function updateVolume(id: string, patch: Partial<Volume>, expectedRevision?: number): Promise<VolumeSaveResult | null> {
     const existing = volumes.value.find((volume) => volume.id === id)
-    await db.volumes.update(id, { ...patch, updatedAt: Date.now() } as never)
-    await loadVolumes()
-    if (existing) await syncBookVolumeCount(existing.bookId)
+    if (!existing) return null
+    const result = await commitVolumeChange(
+      id,
+      { expectedRevision: expectedRevision ?? revisionOf(existing) },
+      async ({ now }) => {
+        await db.volumes.put({ ...existing, ...patch, id, createdAt: existing.createdAt, updatedAt: now })
+      }
+    )
+    if (result.ok) {
+      await loadVolumes()
+      await syncBookVolumeCount(existing.bookId)
+    }
+    return result
   }
 
-  async function removeVolume(id: string): Promise<void> {
+  async function removeVolume(id: string, expectedRevision?: number): Promise<void> {
     const existing = volumes.value.find((volume) => volume.id === id)
+    if (!existing) return
+    if (!isVolumeContentEditable(existing.state)) {
+      throw new Error('该册已装订或归档，不能删除')
+    }
+    if (expectedRevision !== undefined && revisionOf(existing) !== expectedRevision) {
+      throw new Error('该册已被其他窗口更新，请刷新后重试')
+    }
     await removeVolumeCascade(id)
     if (currentVolumeId.value === id) currentVolumeId.value = null
     await loadVolumes()
@@ -172,12 +195,12 @@ export const useBookStore = defineStore('book', () => {
     }
   }
 
-  async function advanceVolumeState(id: string): Promise<void> {
+  async function advanceVolumeState(id: string): Promise<VolumeSaveResult | null> {
     const volume = volumes.value.find((item) => item.id === id)
-    if (!volume) return
+    if (!volume) return null
     const next: VolumeState = nextVolumeState(volume.state)
-    if (next === volume.state) return
-    await updateVolume(id, { state: next })
+    if (next === volume.state || next === 'archived') return null
+    return updateVolume(id, { state: next }, revisionOf(volume))
   }
 
   function volumesOfBook(bookId: string): Volume[] {

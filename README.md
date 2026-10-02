@@ -44,7 +44,7 @@ docker compose up -d --build      # 代码改动后重新构建
 | 构建工具 | Vite 6 | 开发服务器端口 22819 |
 | 状态管理 | Pinia（setup store） | `bookStore` / `leafStore` / `repairStore` |
 | 路由 | Vue Router 4（history 模式） | nginx 侧配合 `try_files` 做 SPA fallback |
-| 本地存储 | Dexie 4（IndexedDB 封装）+ localStorage | 含数据结构版本号与 v1→v2 升级迁移 |
+| 本地存储 | Dexie 4（IndexedDB 封装）+ localStorage | 含数据结构版本号与 v1→v2、v2→v3 升级迁移；v3 为每册增加 `revision` 乐观修订号 |
 | 容器化 | Docker 多阶段构建：`node:20-alpine` → `nginx:alpine` | 构建阶段类型检查 + 打包，运行阶段仅托管静态产物 |
 
 ---
@@ -82,13 +82,13 @@ npm run preview    # 本地预览构建产物（http://localhost:22819）
 | 模型 | 文件 | 关键字段 | 说明 |
 | --- | --- | --- | --- |
 | Book 古籍 | `src/types/book.ts` | `id` `title` `edition` `era` `volumeCount` `collectionNo` `level`（一级/二级/三级/普通） | 新建后进入册次登记，卡片回显待修叶数与已完成工序数 |
-| Volume 册次 | `src/types/volume.ts` | `id` `bookId` `volumeNo` `leafCount` `bindingType`（线装/蝴蝶装/包背装） `state`（待修复/修复中/已装订/已归档） | 装订完成后整册锁定为只读 |
+| Volume 册次 | `src/types/volume.ts` | `id` `bookId` `volumeNo` `leafCount` `bindingType`（线装/蝴蝶装/包背装） `state`（待修复/修复中/已装订/已归档） `revision` | 册级乐观修订号；书叶、补纸、工序或验收保存成功即递增，归档后仅验收人可退回返修 |
 | Leaf 书叶 | `src/types/leaf.ts` | `id` `volumeId` `leafNo` `damageType`（虫蛀/酸化/絮化/缺肉/水渍） `damageAreaCm2` `phValue` `state`（待修/修复中/已修复） | 同叶可叠加多种破损，按册汇总面积与平均 pH |
 | Paper 补纸 | `src/types/paper.ts` | `id` `leafId` `paperType`（竹纸/皮纸/宣纸） `laidPattern` `thicknessMm` `deltaE` `dyeRecipe` | 按色差排序候选，ΔE 超阈值提示重新染色 |
 | RepairOrder 修复工序 | `src/types/repairOrder.ts` | `id` `leafId` `seq` `name`（补破/托裱/溜口/裁齐/压平） `material` `operator` `date` `state`（未开始/进行中/已完成） | 拖拽调序，完成即回写书叶状态 |
 | Binding 装订 | `src/types/binding.ts` | `id` `volumeId` `method` `finishDate` `verdict`（合格/返修） `inspector` | 合格触发全册归档，返修退回修复中 |
 
-数据结构版本号 `DB_VERSION` 定义在 `src/utils/db.ts`，当前为 `v2`：`papers` 表增加 `dyeRecipe` 字段，并在 Dexie `.upgrade()` 中按纸种回填默认染色配方（竹纸 / 皮纸 / 宣纸 各有基准配方）。
+数据结构版本号 `DB_VERSION` 定义在 `src/utils/db.ts`，当前为 `v3`。v1→v2：`papers` 表增加 `dyeRecipe` 字段，并在 Dexie `.upgrade()` 中按纸种回填默认染色配方（竹纸 / 皮纸 / 宣纸 各有基准配方）。v2→v3：`volumes` 表增加 `revision` 整册修订号；旧册按状态补齐（已归档为 1，其余为 0），旧 JSON 备份导入时也会执行同样的兼容补齐。
 
 ---
 
@@ -99,12 +99,12 @@ sologsb101-1019/
 ├── frontend/                     # 前端源码
 │   ├── src/
 │   │   ├── types/                # book.ts volume.ts leaf.ts paper.ts repairOrder.ts binding.ts
-│   │   ├── stores/               # bookStore.ts leafStore.ts repairStore.ts
+│   │   ├── stores/               # bookStore.ts leafStore.ts repairStore.ts paperStore.ts
 │   │   ├── components/common/    # DamageTag.vue FilterBar.vue StatBadge.vue EmptyPanel.vue
 │   │   ├── hooks/                # useLeafStats.ts useIdbTable.ts
 │   │   ├── pages/                # BookList.vue LeafBoard.vue PaperMatch.vue RepairWorkflow.vue ExportView.vue
 │   │   ├── router/               # index.ts
-│   │   ├── utils/                # paperColor.ts db.ts export.ts
+│   │   ├── utils/                # paperColor.ts db.ts concurrency.ts export.ts
 │   │   ├── styles/               # main.css
 │   │   ├── App.vue main.ts env.d.ts
 │   ├── public/favicon.svg

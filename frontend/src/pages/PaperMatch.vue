@@ -11,9 +11,11 @@ import DamageTag from '@/components/common/DamageTag.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import FilterBar, { useFilterQuery, type FilterModel } from '@/components/common/FilterBar.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
-import { useIdbTable } from '@/hooks/useIdbTable'
 import { useBookStore } from '@/stores/bookStore'
 import { useLeafStore } from '@/stores/leafStore'
+import { usePaperStore } from '@/stores/paperStore'
+import { isVolumeContentEditable } from '@/types/volume'
+import { captureVolumeScope, revisionOf, type VolumeSaveResult, type VolumeScopeSnapshot } from '@/utils/concurrency'
 import {
   DEFAULT_DYE_RECIPE,
   DELTA_E_THRESHOLD,
@@ -38,7 +40,7 @@ import {
 
 const bookStore = useBookStore()
 const leafStore = useLeafStore()
-const paperTable = useIdbTable<Paper>((database) => database.papers, { sortByUpdatedAt: false })
+const paperStore = usePaperStore()
 
 const FILTER_KEYS = ['paperType', 'laidPattern'] as const
 const url = useFilterQuery(FILTER_KEYS)
@@ -77,11 +79,51 @@ function leafPattern(leafId: string): string {
   return leaf.damageType === 'stain' ? '细帘纹' : '二指帘纹'
 }
 
+function volumeForLeaf(leafId: string) {
+  const leaf = leafStore.leafById(leafId)
+  return leaf ? bookStore.volumeById(leaf.volumeId) : undefined
+}
+
+function leafLocked(leafId: string): boolean {
+  const volume = volumeForLeaf(leafId)
+  return volume ? !isVolumeContentEditable(volume.state) : true
+}
+
+async function beginEditing(leafId: string): Promise<void> {
+  const leaf = leafStore.leafById(leafId)
+  if (leaf) baseline.value = await captureVolumeScope(leaf.volumeId)
+}
+
+function saveOptions(leafId: string) {
+  return { expectedRevision: revisionOf(volumeForLeaf(leafId)), baseline: baseline.value }
+}
+
+function reportSave(result: VolumeSaveResult | null): result is Extract<VolumeSaveResult, { ok: true }> {
+  if (!result) {
+    ElMessage.error('未找到记录，保存未完成')
+    return false
+  }
+  if (!result.ok) {
+    ElMessage.error({ message: result.message, duration: 8000, showClose: true })
+    return false
+  }
+  return true
+}
+
+async function guardSave(action: () => Promise<VolumeSaveResult | null>): Promise<boolean> {
+  try {
+    return reportSave(await action())
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '保存失败')
+    return false
+  }
+}
+
 const rows = computed(() => {
   const keyword = url.keyword.value.trim()
   const types = url.values.value.paperType ?? []
   const patterns = url.values.value.laidPattern ?? []
-  const list = paperTable.rows.value.filter((paper) => {
+  const list = paperStore.papers.filter((paper) => {
     if (keyword.length > 0) {
       const haystack = `${leafLabel(paper.leafId)}${paper.dyeRecipe}${paper.thicknessMm}`
       if (!haystack.includes(keyword)) return false
@@ -102,7 +144,7 @@ const rows = computed(() => {
 })
 
 const stat = computed(() => {
-  const list = paperTable.rows.value
+  const list = paperStore.papers
   const averageDeltaE =
     list.length === 0 ? 0 : Math.round((list.reduce((sum, paper) => sum + paper.deltaE, 0) / list.length) * 100) / 100
   return {
@@ -123,6 +165,7 @@ const stat = computed(() => {
 const dialog = ref(false)
 const editing = ref<Paper | null>(null)
 const form = reactive<PaperDraft>(createEmptyPaperDraft(''))
+const baseline = ref<VolumeScopeSnapshot | null>(null)
 const leafOptions = computed(() =>
   bookStore.books.flatMap((book) =>
     bookStore.volumesOfBook(book.id).flatMap((volume) =>
@@ -134,18 +177,29 @@ const leafOptions = computed(() =>
   )
 )
 
-function openCreate(): void {
-  const firstLeaf = leafOptions.value[0]
+async function openCreate(): Promise<void> {
+  const firstLeaf = leafOptions.value.find((item) => !leafLocked(item.value)) ?? leafOptions.value[0]
   if (!firstLeaf) {
     ElMessage.warning('请先登记书叶')
     return
   }
+  const targetLeafId = firstLeaf.value
+  if (leafLocked(targetLeafId)) {
+    ElMessage.warning('该册已装订或归档，不能新增补纸记录')
+    return
+  }
+  await beginEditing(targetLeafId)
   editing.value = null
-  Object.assign(form, createEmptyPaperDraft(firstLeaf.value))
+  Object.assign(form, createEmptyPaperDraft(targetLeafId))
   dialog.value = true
 }
 
-function openEdit(paper: Paper): void {
+async function openEdit(paper: Paper): Promise<void> {
+  if (leafLocked(paper.leafId)) {
+    ElMessage.warning('该册已装订或归档，不能编辑补纸记录')
+    return
+  }
+  await beginEditing(paper.leafId)
   editing.value = paper
   Object.assign(form, {
     leafId: paper.leafId,
@@ -178,16 +232,25 @@ async function submit(): Promise<void> {
     return
   }
   if (editing.value) {
-    await paperTable.update(editing.value.id, { ...form })
-    ElMessage.success('已更新补纸记录')
-  } else {
-    await paperTable.create({ ...form }, 'paper')
-    ElMessage.success(needRedye(form.deltaE) ? '已新增补纸，色差超阈值需重新染色' : '已新增补纸记录')
+    if (await guardSave(() => paperStore.updatePaper(editing.value!.id, { ...form }, saveOptions(form.leafId)))) {
+      ElMessage.success(`已更新补纸记录（第 ${revisionOf(volumeForLeaf(form.leafId)) + 1} 版）`)
+      dialog.value = false
+    }
+  } else if (await guardSave(() => paperStore.createPaper({ ...form }, saveOptions(form.leafId)))) {
+    ElMessage.success(
+      needRedye(form.deltaE)
+        ? `已新增补纸，色差超阈值需重新染色（第 ${revisionOf(volumeForLeaf(form.leafId)) + 1} 版）`
+        : `已新增补纸记录（第 ${revisionOf(volumeForLeaf(form.leafId)) + 1} 版）`
+    )
+    dialog.value = false
   }
-  dialog.value = false
 }
 
 async function remove(paper: Paper): Promise<void> {
+  if (leafLocked(paper.leafId)) {
+    ElMessage.warning('该册已装订或归档，不能删除补纸记录')
+    return
+  }
   try {
     await ElMessageBox.confirm('将删除该补纸选配记录。', '删除补纸', {
       type: 'warning',
@@ -197,8 +260,10 @@ async function remove(paper: Paper): Promise<void> {
   } catch {
     return
   }
-  await paperTable.remove(paper.id)
-  ElMessage.success('已删除')
+  await beginEditing(paper.leafId)
+  if (await guardSave(() => paperStore.removePaper(paper.id, saveOptions(paper.leafId)))) {
+    ElMessage.success(`已删除（第 ${revisionOf(volumeForLeaf(paper.leafId)) + 1} 版）`)
+  }
 }
 
 /* ----------------------------- 候选推荐 ----------------------------- */
@@ -209,7 +274,7 @@ const candidates = computed(() => {
   if (!leaf) return []
   const patterns = ['二指帘纹', '三指帘纹', '细帘纹']
   return PAPER_TYPE_OPTIONS.map((option) => {
-    const paper = paperTable.rows.value.find(
+    const paper = paperStore.papers.find(
       (item) => item.leafId === leaf.id && item.paperType === option.value
     )
     const deltaE = paper ? paper.deltaE : deltaEForLeaf(leaf.damageType, option.value)
@@ -234,7 +299,12 @@ const candidateLeafPattern = computed(() =>
 
 async function selectCandidate(type: PaperType, deltaE: number, laidPatternValue: string, thicknessMm: number): Promise<void> {
   if (!candidateLeafId.value) return
-  const existing = paperTable.rows.value.find(
+  if (leafLocked(candidateLeafId.value)) {
+    ElMessage.warning('该册已装订或归档，不能选配补纸')
+    return
+  }
+  await beginEditing(candidateLeafId.value)
+  const existing = paperStore.papers.find(
     (item) => item.leafId === candidateLeafId.value && item.paperType === type
   )
   const payload: PaperDraft = {
@@ -246,11 +316,12 @@ async function selectCandidate(type: PaperType, deltaE: number, laidPatternValue
     dyeRecipe: DEFAULT_DYE_RECIPE[type]
   }
   if (existing) {
-    await paperTable.update(existing.id, payload)
-    ElMessage.success(`已更新${PAPER_TYPE_LABEL[type]}候选`)
-  } else {
-    await paperTable.create(payload, 'paper')
-    ElMessage.success(`已采用${PAPER_TYPE_LABEL[type]}候选补纸`)
+    const target = existing
+    if (await guardSave(() => paperStore.updatePaper(target.id, payload, saveOptions(payload.leafId)))) {
+      ElMessage.success(`已更新${PAPER_TYPE_LABEL[type]}候选（第 ${revisionOf(volumeForLeaf(payload.leafId)) + 1} 版）`)
+    }
+  } else if (await guardSave(() => paperStore.createPaper(payload, saveOptions(payload.leafId)))) {
+    ElMessage.success(`已采用${PAPER_TYPE_LABEL[type]}候选补纸（第 ${revisionOf(volumeForLeaf(payload.leafId)) + 1} 版）`)
   }
 }
 
@@ -299,9 +370,9 @@ function deltaTag(deltaE: number): { label: string; color: string } {
         <el-card shadow="never">
           <EmptyPanel
             v-if="rows.length === 0"
-            :title="paperTable.rows.value.length === 0 ? '还没有补纸选配记录' : '当前条件下没有记录'"
+            :title="paperStore.papers.length === 0 ? '还没有补纸选配记录' : '当前条件下没有记录'"
             :description="
-              paperTable.rows.value.length === 0
+              paperStore.papers.length === 0
                 ? '为破损书叶选配补纸，记录纸种、帘纹、厚度、色差与染色配方。'
                 : '试着调整纸种或帘纹筛选条件。'
             "
@@ -349,8 +420,8 @@ function deltaTag(deltaE: number): { label: string; color: string } {
             </el-table-column>
             <el-table-column label="操作" width="150">
               <template #default="{ row }">
-                <el-button size="small" text :icon="Edit" @click="openEdit(row)">编辑</el-button>
-                <el-button size="small" text type="danger" :icon="Delete" @click="remove(row)">删除</el-button>
+                <el-button size="small" :disabled="leafLocked(row.leafId)" :icon="Edit" @click="openEdit(row)">编辑</el-button>
+                <el-button size="small" text type="danger" :disabled="leafLocked(row.leafId)" :icon="Delete" @click="remove(row)">删除</el-button>
               </template>
             </el-table-column>
           </el-table>
@@ -387,6 +458,7 @@ function deltaTag(deltaE: number): { label: string; color: string } {
                 {{ item.thicknessMm }}mm · {{ item.hasRecord ? '已有登记' : '尚无登记（按基准色估算）' }}
               </div>
               <el-button
+                :disabled="leafLocked(candidateLeafId)"
                 size="small"
                 style="margin-top: 6px"
                 @click="selectCandidate(item.type, item.deltaE, item.laidPattern, item.thicknessMm)"

@@ -26,6 +26,7 @@ import {
   type BookLevel
 } from '@/types/book'
 import type { Binding } from '@/types/binding'
+import { revisionOf } from '@/utils/concurrency'
 import {
   BINDING_TYPE_LABEL,
   BINDING_TYPE_OPTIONS,
@@ -127,7 +128,12 @@ async function removeBook(book: Book): Promise<void> {
   } catch {
     return
   }
-  await bookStore.removeBook(book.id)
+  try {
+    await bookStore.removeBook(book.id)
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '删除失败')
+    return
+  }
   ElMessage.success(`已删除《${book.title}》`)
 }
 
@@ -135,6 +141,7 @@ async function removeBook(book: Book): Promise<void> {
 const volumeDialog = ref(false)
 const volumeBook = ref<Book | null>(null)
 const editingVolume = ref<Volume | null>(null)
+const editingRevision = ref(0)
 const volumeForm = reactive<VolumeDraft>(createEmptyVolumeDraft('', 1))
 
 const volumeList = computed(() => (volumeBook.value ? bookStore.volumesOfBook(volumeBook.value.id) : []))
@@ -147,6 +154,11 @@ function openVolumeDialog(book: Book): void {
 }
 
 function openEditVolume(volume: Volume): void {
+  if (isVolumeLocked(volume.state)) {
+    ElMessage.warning('该册已装订或归档，不能直接编辑册次信息')
+    return
+  }
+  editingRevision.value = revisionOf(volume)
   editingVolume.value = volume
   Object.assign(volumeForm, {
     bookId: volume.bookId,
@@ -159,8 +171,20 @@ function openEditVolume(volume: Volume): void {
 
 async function submitVolume(): Promise<void> {
   if (editingVolume.value) {
-    await bookStore.updateVolume(editingVolume.value.id, { ...volumeForm })
-    ElMessage.success(`已更新第 ${volumeForm.volumeNo} 册`)
+    if (volumeForm.state === 'archived') {
+      ElMessage.warning('册次只能通过验收合格后归档，不能手工改为已归档')
+      return
+    }
+    const result = await bookStore.updateVolume(editingVolume.value.id, { ...volumeForm }, editingRevision.value)
+    if (!result) {
+      ElMessage.error('未找到该册次')
+      return
+    }
+    if (!result.ok) {
+      ElMessage.error({ message: result.message, duration: 8000, showClose: true })
+      return
+    }
+    ElMessage.success(`已更新第 ${volumeForm.volumeNo} 册（第 ${result.revision} 版）`)
   } else {
     await bookStore.createVolume({ ...volumeForm })
     ElMessage.success(`已新增第 ${volumeForm.volumeNo} 册`)
@@ -179,13 +203,26 @@ async function removeVolume(volume: Volume): Promise<void> {
   } catch {
     return
   }
-  await bookStore.removeVolume(volume.id)
+  try {
+    await bookStore.removeVolume(volume.id, revisionOf(volume))
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '删除失败')
+    return
+  }
   ElMessage.success('已删除该册次')
 }
 
 async function advanceVolume(volume: Volume): Promise<void> {
-  await bookStore.advanceVolumeState(volume.id)
-  ElMessage.success(`第 ${volume.volumeNo} 册状态已推进`)
+  const result = await bookStore.advanceVolumeState(volume.id)
+  if (!result) {
+    ElMessage.warning('当前状态不能手工推进；已归档需由验收页处理')
+    return
+  }
+  if (!result.ok) {
+    ElMessage.error({ message: result.message, duration: 8000, showClose: true })
+    return
+  }
+  ElMessage.success(`第 ${volume.volumeNo} 册状态已推进（第 ${result.revision} 版）`)
 }
 
 function openLeaves(book: Book): void {
@@ -391,7 +428,7 @@ function bindingLabel(value: string): string {
         </el-form-item>
         <el-form-item label="状态">
           <el-select v-model="volumeForm.state" style="width: 130px">
-            <el-option v-for="item in VOLUME_STATE_OPTIONS" :key="item.value" :label="item.label" :value="item.value" />
+            <el-option v-for="item in VOLUME_STATE_OPTIONS.filter((option) => option.value !== 'archived')" :key="item.value" :label="item.label" :value="item.value" />
           </el-select>
         </el-form-item>
         <el-form-item>
@@ -406,7 +443,7 @@ function bindingLabel(value: string): string {
           <template #default="{ row }">{{ bindingLabel(row.bindingType) }}</template>
         </el-table-column>
         <el-table-column prop="leafCount" label="叶数" width="80" />
-        <el-table-column label="状态" width="110">
+        <el-table-column label="状态 / 版本" width="135">
           <template #default="{ row }">
             <el-tag
               :style="{ background: `${volumeStateColor(row.state)}1f`, color: volumeStateColor(row.state) }"
@@ -415,6 +452,7 @@ function bindingLabel(value: string): string {
             >
               {{ volumeStateLabel(row.state) }}
             </el-tag>
+            <el-tag type="info" effect="plain" round size="small">v{{ revisionOf(row) }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="破损 / 工序" min-width="140">
@@ -424,9 +462,9 @@ function bindingLabel(value: string): string {
         </el-table-column>
         <el-table-column label="操作" width="240">
           <template #default="{ row }">
-            <el-button size="small" text type="primary" @click="advanceVolume(row)">推进状态</el-button>
+            <el-button size="small" text type="primary" :disabled="isVolumeLocked(row.state)" @click="advanceVolume(row)">推进状态</el-button>
             <el-button size="small" text :disabled="isVolumeLocked(row.state)" @click="openEditVolume(row)">编辑</el-button>
-            <el-button size="small" text type="danger" @click="removeVolume(row)">删除</el-button>
+            <el-button size="small" text type="danger" :disabled="isVolumeLocked(row.state)" @click="removeVolume(row)">删除</el-button>
           </template>
         </el-table-column>
       </el-table>

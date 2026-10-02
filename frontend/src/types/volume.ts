@@ -21,11 +21,13 @@ export interface Volume {
   bindingType: BindingType;
   /** 当前状态 */
   state: VolumeState;
+  /** 乐观修订号：册次内任一处保存成功后递增 */
+  revision: number;
   createdAt: number;
   updatedAt: number;
 }
 
-export type VolumeDraft = Omit<Volume, 'id' | 'createdAt' | 'updatedAt'>;
+export type VolumeDraft = Omit<Volume, 'id' | 'createdAt' | 'updatedAt' | 'revision'>;
 
 export const BINDING_TYPE_LABEL: Record<BindingType, string> = {
   thread: '线装',
@@ -60,9 +62,25 @@ export const VOLUME_STATE_OPTIONS: ReadonlyArray<{ value: VolumeState; label: st
   { value: 'archived', label: '已归档' },
 ];
 
-/** 装订完成后整册锁定为只读 */
+/** 已装订后内容锁定；已归档仅允许验收人退回返修 */
 export function isVolumeLocked(state: VolumeState): boolean {
   return state === 'bound' || state === 'archived';
+}
+
+/** 修复内容（书叶、补纸、工序）是否可编辑 */
+export function isVolumeContentEditable(state: VolumeState): boolean {
+  return state === 'pending' || state === 'repairing';
+}
+
+/** 为旧数据补齐修订号：已归档以 1 作为稳定基线，其余从 0 开始 */
+export function initialVolumeRevision(state: VolumeState): number {
+  return state === 'archived' ? 1 : 0;
+}
+
+export function normalizeVolumeRevision(volume: Pick<Volume, 'state' | 'revision'>): number {
+  return Number.isInteger(volume.revision) && volume.revision >= 0
+    ? volume.revision
+    : initialVolumeRevision(volume.state);
 }
 
 export const VOLUME_STATE_FLOW: readonly VolumeState[] = ['pending', 'repairing', 'bound', 'archived'];

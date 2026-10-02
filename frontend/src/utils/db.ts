@@ -7,7 +7,7 @@
  */
 import Dexie, { type Table } from 'dexie'
 import type { Book } from '@/types/book'
-import type { Volume } from '@/types/volume'
+import { initialVolumeRevision, normalizeVolumeRevision, type Volume } from '@/types/volume'
 import type { Leaf } from '@/types/leaf'
 import { DEFAULT_DYE_RECIPE, type Paper } from '@/types/paper'
 import type { RepairOrder } from '@/types/repairOrder'
@@ -17,7 +17,7 @@ import type { Binding } from '@/types/binding'
 export const DB_NAME = 'gbbookrestore'
 
 /** 当前数据结构版本号 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** localStorage 侧少量元数据键 */
 export const LS_KEYS = {
@@ -122,6 +122,26 @@ export class BookRestoreDatabase extends Dexie {
             if (typeof paper.thicknessMm !== 'number') paper.thicknessMm = 0.06
           })
       })
+    // v3：Volume 增加整册修订号 revision；旧数据按归档状态补齐
+    this.version(DB_VERSION)
+      .stores({
+        books: 'id, title, era, level, collectionNo, updatedAt',
+        volumes: 'id, bookId, volumeNo, bindingType, state, revision, updatedAt',
+        leaves: 'id, volumeId, leafNo, damageType, phValue, state, updatedAt',
+        papers: 'id, leafId, paperType, laidPattern, deltaE, updatedAt',
+        repairOrders: 'id, leafId, seq, name, operator, state, updatedAt',
+        bindings: 'id, volumeId, method, verdict, finishDate, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        await tx
+          .table<Volume>('volumes')
+          .toCollection()
+          .modify((volume) => {
+            if (!Number.isInteger(volume.revision) || volume.revision < 0) {
+              volume.revision = initialVolumeRevision(volume.state)
+            }
+          })
+      })
   }
 }
 
@@ -186,10 +206,10 @@ export async function seedDatabase(): Promise<void> {
   ]
 
   const volumes: Volume[] = [
-    { id: 'vol_0101', bookId: 'book_01', volumeNo: 1, leafCount: 24, bindingType: 'thread', state: 'repairing', createdAt: now - day * 38, updatedAt: now - day * 3 },
-    { id: 'vol_0102', bookId: 'book_01', volumeNo: 2, leafCount: 18, bindingType: 'wrapped', state: 'pending', createdAt: now - day * 38, updatedAt: now - day * 6 },
-    { id: 'vol_0201', bookId: 'book_02', volumeNo: 1, leafCount: 30, bindingType: 'thread', state: 'archived', createdAt: now - day * 30, updatedAt: now - day * 2 },
-    { id: 'vol_0301', bookId: 'book_03', volumeNo: 1, leafCount: 12, bindingType: 'butterfly', state: 'archived', createdAt: now - day * 55, updatedAt: now - day * 5 }
+    { id: 'vol_0101', bookId: 'book_01', volumeNo: 1, leafCount: 24, bindingType: 'thread', state: 'repairing', revision: 4, createdAt: now - day * 38, updatedAt: now - day * 3 },
+    { id: 'vol_0102', bookId: 'book_01', volumeNo: 2, leafCount: 18, bindingType: 'wrapped', state: 'pending', revision: 1, createdAt: now - day * 38, updatedAt: now - day * 6 },
+    { id: 'vol_0201', bookId: 'book_02', volumeNo: 1, leafCount: 30, bindingType: 'thread', state: 'archived', revision: 3, createdAt: now - day * 30, updatedAt: now - day * 2 },
+    { id: 'vol_0301', bookId: 'book_03', volumeNo: 1, leafCount: 12, bindingType: 'butterfly', state: 'archived', revision: 2, createdAt: now - day * 55, updatedAt: now - day * 5 }
   ]
 
   const leaves: Leaf[] = [
@@ -313,7 +333,7 @@ export async function importSnapshot(snapshot: RestoreSnapshot): Promise<void> {
         db.bindings.clear()
       ])
       await db.books.bulkPut(snapshot.books)
-      await db.volumes.bulkPut(snapshot.volumes)
+      await db.volumes.bulkPut(snapshot.volumes.map((volume) => ({ ...volume, revision: normalizeVolumeRevision(volume) })))
       await db.leaves.bulkPut(snapshot.leaves)
       await db.papers.bulkPut(snapshot.papers)
       await db.repairOrders.bulkPut(snapshot.repairOrders)

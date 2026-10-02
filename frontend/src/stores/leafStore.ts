@@ -4,7 +4,8 @@
  */
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
-import { createId, db, removeLeafCascade } from '@/utils/db'
+import { createId, db } from '@/utils/db'
+import { useBookStore } from '@/stores/bookStore'
 import {
   nextLeafState,
   type DamageType,
@@ -12,6 +13,8 @@ import {
   type LeafDraft,
   type LeafState
 } from '@/types/leaf'
+import { commitVolumeChange, revisionOf, type VolumeSaveResult, type VolumeScopeSnapshot } from '@/utils/concurrency'
+import { isVolumeContentEditable, type Volume } from '@/types/volume'
 
 export interface LeafFilters {
   keyword: string
@@ -45,6 +48,17 @@ export const useLeafStore = defineStore('leaf', () => {
 
   function leavesOfVolume(volumeId: string): Leaf[] {
     return leaves.value.filter((leaf) => leaf.volumeId === volumeId).sort((a, b) => a.leafNo - b.leafNo)
+  }
+
+  function volumeFromLoaded(volumeId: string): Volume | undefined {
+    return useBookStore().volumes.find((item) => item.id === volumeId)
+  }
+
+  function requireWritableVolume(volumeId: string): Volume {
+    const volume = volumeFromLoaded(volumeId)
+    if (!volume) throw new Error('未找到对应册次')
+    if (!isVolumeContentEditable(volume.state)) throw new Error('该册已装订或归档，不能修改书叶记录')
+    return volume
   }
 
   /** 书叶页展示用筛选结果（按册 + 关键字 + 破损类型 + 状态） */
@@ -98,38 +112,87 @@ export const useLeafStore = defineStore('leaf', () => {
     filters.value = { ...DEFAULT_LEAF_FILTERS }
   }
 
-  async function createLeaf(draft: LeafDraft): Promise<Leaf> {
-    const now = Date.now()
-    const row: Leaf = { ...draft, id: createId('leaf'), createdAt: now, updatedAt: now }
-    await db.leaves.put(row)
-    await loadLeaves()
-    return row
+  interface LeafMutationOptions {
+    expectedRevision: number
+    baseline?: VolumeScopeSnapshot | null
   }
 
-  async function updateLeaf(id: string, patch: Partial<Leaf>): Promise<void> {
-    await db.leaves.update(id, { ...patch, updatedAt: Date.now() } as never)
-    await loadLeaves()
+  async function createLeaf(draft: LeafDraft, options: LeafMutationOptions): Promise<VolumeSaveResult> {
+    requireWritableVolume(draft.volumeId)
+    const result = await commitVolumeChange(
+      draft.volumeId,
+      options,
+      async ({ now }) => {
+        await db.leaves.put({ ...draft, id: createId('leaf'), createdAt: now, updatedAt: now })
+      },
+      options.baseline
+    )
+    if (result.ok) await loadLeaves()
+    return result
   }
 
-  async function removeLeaf(id: string): Promise<void> {
-    await removeLeafCascade(id)
-    await loadLeaves()
+  async function updateLeaf(id: string, patch: Partial<Leaf>, options?: LeafMutationOptions): Promise<VolumeSaveResult | null> {
+    const existing = leaves.value.find((leaf) => leaf.id === id)
+    if (!existing) return null
+    const volume = requireWritableVolume(existing.volumeId)
+    const result = await commitVolumeChange(
+      existing.volumeId,
+      options ?? { expectedRevision: revisionOf(volume) },
+      async ({ now }) => {
+        await db.leaves.put({ ...existing, ...patch, id, volumeId: existing.volumeId, createdAt: existing.createdAt, updatedAt: now })
+      },
+      options?.baseline
+    )
+    if (result.ok) await loadLeaves()
+    return result
   }
 
-  async function batchUpdate(ids: string[], patch: Partial<Leaf>): Promise<void> {
-    if (ids.length === 0) return
-    const now = Date.now()
-    const rows = leaves.value.filter((leaf) => ids.includes(leaf.id)).map((leaf) => ({ ...leaf, ...patch, updatedAt: now }))
-    await db.leaves.bulkPut(rows)
-    await loadLeaves()
+  async function removeLeaf(id: string, options?: LeafMutationOptions): Promise<VolumeSaveResult | null> {
+    const existing = leaves.value.find((leaf) => leaf.id === id)
+    if (!existing) return null
+    requireWritableVolume(existing.volumeId)
+    const volume = volumeFromLoaded(existing.volumeId) as Volume
+    const result = await commitVolumeChange(
+      existing.volumeId,
+      options ?? { expectedRevision: revisionOf(volume) },
+      async () => {
+        await db.papers.where('leafId').equals(id).delete()
+        await db.repairOrders.where('leafId').equals(id).delete()
+        await db.leaves.delete(id)
+      },
+      options?.baseline
+    )
+    if (result.ok) await loadLeaves()
+    return result
   }
 
-  async function advanceLeafState(id: string): Promise<void> {
+  /** 批量操作限定同一册，避免一次保存跨过不同修订号 */
+  async function batchUpdate(ids: string[], patch: Partial<Leaf>, options: LeafMutationOptions): Promise<VolumeSaveResult> {
+    const selected = leaves.value.filter((leaf) => ids.includes(leaf.id))
+    const volumeIds = Array.from(new Set(selected.map((leaf) => leaf.volumeId)))
+    if (volumeIds.length !== 1) throw new Error('批量操作只能选择同一册次的书叶')
+    const volumeId = volumeIds[0] as string
+    requireWritableVolume(volumeId)
+    const result = await commitVolumeChange(
+      volumeId,
+      options,
+      async ({ now }) => {
+        await db.leaves.bulkPut(
+          selected.map((leaf) => ({ ...leaf, ...patch, id: leaf.id, volumeId: leaf.volumeId, createdAt: leaf.createdAt, updatedAt: now }))
+        )
+      },
+      options.baseline
+    )
+    if (result.ok) await loadLeaves()
+    return result
+  }
+
+  async function advanceLeafState(id: string, options?: LeafMutationOptions): Promise<VolumeSaveResult | null> {
     const leaf = leaves.value.find((item) => item.id === id)
-    if (!leaf) return
+    if (!leaf) return null
     const next = nextLeafState(leaf.state)
-    if (next === leaf.state) return
-    await updateLeaf(id, { state: next })
+    if (next === leaf.state) return null
+    return updateLeaf(id, { state: next }, options)
   }
 
   function leafById(id: string): Leaf | undefined {

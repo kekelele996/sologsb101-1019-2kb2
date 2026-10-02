@@ -11,10 +11,11 @@ import DamageTag from '@/components/common/DamageTag.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import FilterBar, { useFilterQuery, type FilterModel } from '@/components/common/FilterBar.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
-import { useIdbTable } from '@/hooks/useIdbTable'
 import { useBookStore } from '@/stores/bookStore'
 import { useLeafStore } from '@/stores/leafStore'
 import { useRepairStore } from '@/stores/repairStore'
+import { usePaperStore } from '@/stores/paperStore'
+import { captureVolumeScope, revisionOf, type VolumeSaveResult, type VolumeScopeSnapshot } from '@/utils/concurrency'
 import { DAMAGE_TYPE_LABEL } from '@/types/leaf'
 import {
   ORDER_STATE_COLOR,
@@ -28,12 +29,13 @@ import {
   type RepairOrder,
   type RepairOrderDraft
 } from '@/types/repairOrder'
-import { PAPER_TYPE_LABEL, type Paper } from '@/types/paper'
+import { PAPER_TYPE_LABEL } from '@/types/paper'
+import { isVolumeContentEditable } from '@/types/volume'
 
 const bookStore = useBookStore()
 const leafStore = useLeafStore()
 const repairStore = useRepairStore()
-const paperTable = useIdbTable<Paper>((database) => database.papers, { sortByUpdatedAt: false })
+const paperStore = usePaperStore()
 
 const FILTER_KEYS = ['name', 'state'] as const
 const url = useFilterQuery(FILTER_KEYS)
@@ -63,8 +65,11 @@ watch(
 )
 
 const currentLeaf = computed(() => (currentLeafId.value ? leafStore.leafById(currentLeafId.value) : undefined))
+const currentVolume = computed(() => (currentLeaf.value ? bookStore.volumeById(currentLeaf.value.volumeId) : null))
+const locked = computed(() => (currentVolume.value ? !isVolumeContentEditable(currentVolume.value.state) : false))
+const baseline = ref<VolumeScopeSnapshot | null>(null)
 const currentPaper = computed(() =>
-  currentLeafId.value ? paperTable.rows.value.find((paper) => paper.leafId === currentLeafId.value) : undefined
+  currentLeafId.value ? paperStore.paperForLeaf(currentLeafId.value) : undefined
 )
 
 const filterModel = computed<FilterModel>(() => ({
@@ -122,6 +127,39 @@ const blocking = computed(() => {
   return list.slice(0, index).find((order) => order.state !== 'done') ?? null
 })
 
+async function beginEditing(leafId: string): Promise<void> {
+  const leaf = leafStore.leafById(leafId)
+  if (!leaf) return
+  baseline.value = await captureVolumeScope(leaf.volumeId)
+}
+
+function saveOptions(leafId: string) {
+  const leaf = leafStore.leafById(leafId)
+  const volume = leaf ? bookStore.volumeById(leaf.volumeId) : undefined
+  return { expectedRevision: revisionOf(volume), baseline: baseline.value }
+}
+
+function reportSave(result: VolumeSaveResult | null): result is Extract<VolumeSaveResult, { ok: true }> {
+  if (!result) {
+    ElMessage.error('未找到记录，保存未完成')
+    return false
+  }
+  if (!result.ok) {
+    ElMessage.error({ message: result.message, duration: 8000, showClose: true })
+    return false
+  }
+  return true
+}
+
+async function guardSave(action: () => Promise<VolumeSaveResult | null>): Promise<boolean> {
+  try {
+    return reportSave(await action())
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '保存失败')
+    return false
+  }
+}
+
 /* ----------------------------- 工序表单 ----------------------------- */
 const dialog = ref(false)
 const editing = ref<RepairOrder | null>(null)
@@ -130,17 +168,27 @@ const selectedIds = ref<string[]>([])
 const dragId = ref('')
 const overId = ref('')
 
-function openCreate(): void {
+async function openCreate(): Promise<void> {
   if (!currentLeafId.value) {
     ElMessage.warning('请先选择书叶')
     return
   }
+  if (locked.value) {
+    ElMessage.warning('该册已装订或归档，不能新增工序')
+    return
+  }
+  await beginEditing(currentLeafId.value)
   editing.value = null
   Object.assign(form, createEmptyOrderDraft(currentLeafId.value, repairStore.nextSeq(currentLeafId.value)))
   dialog.value = true
 }
 
-function openEdit(order: RepairOrder): void {
+async function openEdit(order: RepairOrder): Promise<void> {
+  if (locked.value) {
+    ElMessage.warning('该册已装订或归档，不能编辑工序')
+    return
+  }
+  await beginEditing(order.leafId)
   editing.value = order
   Object.assign(form, {
     leafId: order.leafId,
@@ -165,16 +213,21 @@ watch(
 
 async function submit(): Promise<void> {
   if (editing.value) {
-    await repairStore.updateOrder(editing.value.id, { ...form })
-    ElMessage.success('已更新工序')
-  } else {
-    await repairStore.createOrder({ ...form })
-    ElMessage.success(`已新增第 ${form.seq} 道工序`)
+    if (await guardSave(() => repairStore.updateOrder(editing.value!.id, { ...form }, saveOptions(form.leafId)))) {
+      ElMessage.success(`已更新工序（第 ${revisionOf(currentVolume.value) + 1} 版）`)
+      dialog.value = false
+    }
+  } else if (await guardSave(() => repairStore.createOrder({ ...form }, saveOptions(form.leafId)))) {
+    ElMessage.success(`已新增第 ${form.seq} 道工序（第 ${revisionOf(currentVolume.value) + 1} 版）`)
+    dialog.value = false
   }
-  dialog.value = false
 }
 
 async function remove(order: RepairOrder): Promise<void> {
+  if (locked.value) {
+    ElMessage.warning('该册已装订或归档，不能删除工序')
+    return
+  }
   try {
     await ElMessageBox.confirm('删除后其余工序会自动重编号。', '删除工序', {
       type: 'warning',
@@ -184,8 +237,11 @@ async function remove(order: RepairOrder): Promise<void> {
   } catch {
     return
   }
-  await repairStore.removeOrder(order.id)
-  ElMessage.success('已删除')
+  await beginEditing(order.leafId)
+  const expectedRevision = revisionOf(currentVolume.value)
+  if (await guardSave(() => repairStore.removeOrder(order.id, saveOptions(order.leafId)))) {
+    ElMessage.success(`已删除（第 ${expectedRevision + 1} 版）`)
+  }
 }
 
 async function advance(order: RepairOrder): Promise<void> {
@@ -195,8 +251,17 @@ async function advance(order: RepairOrder): Promise<void> {
     ElMessage.warning(`第 ${previous.seq} 道「${REPAIR_NAME_LABEL[previous.name]}」尚未完成，禁止推进`)
     return
   }
-  const next = await repairStore.advanceOrder(order.id)
-  ElMessage.success(`已置为「${ORDER_STATE_LABEL[next]}」${next === 'done' ? '，并回写书叶状态' : ''}`)
+  await beginEditing(order.leafId)
+  let outcome: Awaited<ReturnType<typeof repairStore.advanceOrder>>
+  try {
+    outcome = await repairStore.advanceOrder(order.id, saveOptions(order.leafId))
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '保存失败')
+    return
+  }
+  if (!outcome) return
+  if (!reportSave(outcome.result)) return
+  ElMessage.success(`已置为「${ORDER_STATE_LABEL[outcome.state]}」${outcome.state === 'done' ? '，并回写书叶状态' : ''}（第 ${outcome.result.revision} 版）`)
 }
 
 async function generate(): Promise<void> {
@@ -204,11 +269,14 @@ async function generate(): Promise<void> {
     ElMessage.warning('请先选择书叶')
     return
   }
-  const created = await repairStore.generateSequence(currentLeafId.value)
-  if (created === 0) {
-    ElMessage.info('该叶已有完整工序序列')
-  } else {
-    ElMessage.success(`已生成 ${created} 道标准工序（补破 → 托裱 → 溜口 → 裁齐 → 压平）`)
+  if (locked.value) {
+    ElMessage.warning('该册已装订或归档，不能生成工序')
+    return
+  }
+  await beginEditing(currentLeafId.value)
+  const expectedRevision = revisionOf(currentVolume.value)
+  if (await guardSave(() => repairStore.generateSequence(currentLeafId.value!, saveOptions(currentLeafId.value!)))) {
+    ElMessage.success(`已保存标准工序（补破 → 托裱 → 溜口 → 裁齐 → 压平），当前第 ${expectedRevision + 1} 版`)
   }
 }
 
@@ -217,9 +285,16 @@ async function batchComplete(): Promise<void> {
     ElMessage.warning('请先勾选工序')
     return
   }
-  await repairStore.batchUpdate(selectedIds.value, { state: 'done' })
-  ElMessage.success(`已批量完成 ${selectedIds.value.length} 道工序`)
-  selectedIds.value = []
+  if (!currentLeafId.value || locked.value) {
+    ElMessage.warning(locked.value ? '该册已装订或归档，不能批量完成工序' : '请先选择书叶')
+    return
+  }
+  await beginEditing(currentLeafId.value)
+  const expectedRevision = revisionOf(currentVolume.value)
+  if (await guardSave(() => repairStore.batchUpdate(selectedIds.value, { state: 'done' }, saveOptions(currentLeafId.value!)))) {
+    ElMessage.success(`已批量完成 ${selectedIds.value.length} 道工序（第 ${expectedRevision + 1} 版）`)
+    selectedIds.value = []
+  }
 }
 
 async function drop(targetId: string): Promise<void> {
@@ -227,14 +302,21 @@ async function drop(targetId: string): Promise<void> {
   overId.value = ''
   dragId.value = ''
   if (!from || from === targetId || !currentLeafId.value) return
+  if (locked.value) {
+    ElMessage.warning('该册已装订或归档，不能调整工序')
+    return
+  }
   const ids = repairStore.ordersOfLeaf(currentLeafId.value).map((order) => order.id)
   const fromIndex = ids.indexOf(from)
   const toIndex = ids.indexOf(targetId)
   if (fromIndex < 0 || toIndex < 0) return
   const [moved] = ids.splice(fromIndex, 1)
   ids.splice(toIndex, 0, moved as string)
-  await repairStore.reorderOrders(currentLeafId.value, ids)
-  ElMessage.success('工序顺序已更新并重编号')
+  await beginEditing(currentLeafId.value)
+  const expectedRevision = revisionOf(currentVolume.value)
+  if (await guardSave(() => repairStore.reorderOrders(currentLeafId.value!, ids, saveOptions(currentLeafId.value!)))) {
+    ElMessage.success(`工序顺序已更新并重编号（第 ${expectedRevision + 1} 版）`)
+  }
 }
 
 function toggleSelect(id: string): void {
@@ -269,8 +351,8 @@ watchEffect(() => {
         <el-select v-model="currentLeafId" filterable placeholder="选择书叶" style="width: 320px">
           <el-option v-for="item in leafOptions" :key="item.value" :label="item.label" :value="item.value" />
         </el-select>
-        <el-button :icon="Plus" @click="generate">生成标准序列</el-button>
-        <el-button type="primary" :icon="Plus" @click="openCreate">新增工序</el-button>
+        <el-button :disabled="locked" :icon="Plus" @click="generate">生成标准序列</el-button>
+        <el-button type="primary" :disabled="locked" :icon="Plus" @click="openCreate">新增工序</el-button>
       </div>
     </div>
 
@@ -288,12 +370,23 @@ watchEffect(() => {
         <span>当前书叶：第 {{ currentLeaf.leafNo }} 叶</span>
         <DamageTag :type="currentLeaf.damageType" :note="`${currentLeaf.damageAreaCm2} cm²`" />
         <el-tag effect="plain" round>pH {{ currentLeaf.phValue }}</el-tag>
+        <el-tag effect="plain" round>第 {{ revisionOf(currentVolume) }} 版</el-tag>
         <el-tag v-if="currentPaper" type="success" effect="plain" round>
           补纸：{{ PAPER_TYPE_LABEL[currentPaper.paperType] }} · ΔE {{ currentPaper.deltaE }}
         </el-tag>
         <el-tag v-else type="warning" effect="plain" round>尚未选配补纸</el-tag>
       </div>
     </el-card>
+
+    <el-alert
+      v-if="currentVolume && locked"
+      type="warning"
+      show-icon
+      :closable="false"
+      style="margin-bottom: 14px"
+      title="该册已装订或归档，修复工序只读"
+      description="归档册仅可由验收人在装订归档页退回返修后，才能继续调整工序。"
+    />
 
     <FilterBar
       :model-value="filterModel"
@@ -303,7 +396,7 @@ watchEffect(() => {
       @reset="url.reset()"
     >
       <template #actions>
-        <el-button size="small" :disabled="selectedIds.length === 0" :icon="Check" @click="batchComplete">
+        <el-button size="small" :disabled="selectedIds.length === 0 || locked" :icon="Check" @click="batchComplete">
           批量完成（{{ selectedIds.length }}）
         </el-button>
       </template>
@@ -349,9 +442,9 @@ watchEffect(() => {
           <span class="gb-muted">{{ order.material || '未填材料' }}</span>
           <span class="gb-muted">{{ order.operator || '未填操作人' }} · {{ order.date }}</span>
           <div style="margin-left: auto; display: flex; gap: 4px">
-            <el-button size="small" text type="primary" @click="advance(order)">推进状态</el-button>
-            <el-button size="small" text :icon="Edit" @click="openEdit(order)">编辑</el-button>
-            <el-button size="small" text type="danger" :icon="Delete" @click="remove(order)">删除</el-button>
+            <el-button size="small" text type="primary" :disabled="locked" @click="advance(order)">推进状态</el-button>
+            <el-button size="small" text :disabled="locked" :icon="Edit" @click="openEdit(order)">编辑</el-button>
+            <el-button size="small" text type="danger" :disabled="locked" :icon="Delete" @click="remove(order)">删除</el-button>
           </div>
         </div>
 

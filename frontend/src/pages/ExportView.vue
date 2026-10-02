@@ -14,6 +14,7 @@ import { useLeafStats } from '@/hooks/useLeafStats'
 import { useBookStore } from '@/stores/bookStore'
 import { useLeafStore } from '@/stores/leafStore'
 import { useRepairStore } from '@/stores/repairStore'
+import { usePaperStore } from '@/stores/paperStore'
 import {
   BINDING_METHOD_OPTIONS,
   BINDING_VERDICT_COLOR,
@@ -24,8 +25,20 @@ import {
   type BindingDraft,
   type BindingVerdict
 } from '@/types/binding'
-import { BINDING_TYPE_LABEL, VOLUME_STATE_LABEL, isVolumeLocked } from '@/types/volume'
-import type { Paper } from '@/types/paper'
+import {
+  BINDING_TYPE_LABEL,
+  VOLUME_STATE_LABEL,
+  isVolumeLocked
+} from '@/types/volume'
+import {
+  captureVolumeScope,
+  removeAcceptanceBinding,
+  returnArchivedVolumeForRework,
+  revisionOf,
+  saveAcceptanceBinding,
+  type VolumeSaveResult,
+  type VolumeScopeSnapshot
+} from '@/utils/concurrency'
 import {
   DB_NAME,
   DB_VERSION,
@@ -49,8 +62,8 @@ const bookStore = useBookStore()
 const leafStore = useLeafStore()
 const repairStore = useRepairStore()
 const { totals } = useLeafStats()
+const paperStore = usePaperStore()
 const bindingTable = useIdbTable<Binding>((database) => database.bindings, { sortByUpdatedAt: false })
-const paperTable = useIdbTable<Paper>((database) => database.papers, { sortByUpdatedAt: false })
 
 const fileInput = ref<HTMLInputElement | null>(null)
 const lastBackupAt = ref<string | null>(readLastBackupAt())
@@ -91,7 +104,7 @@ const context = computed(() => ({
   books: bookStore.books,
   volumes: bookStore.volumes,
   leaves: leafStore.leaves,
-  papers: paperTable.rows.value,
+  papers: paperStore.papers,
   repairOrders: repairStore.orders,
   bindings: bindingTable.rows.value
 }))
@@ -102,19 +115,42 @@ const archiveText = computed(() => buildArchiveReport(context.value))
 const dialog = ref(false)
 const editing = ref<Binding | null>(null)
 const form = reactive<BindingDraft>(createEmptyBindingDraft(''))
+const baseline = ref<VolumeScopeSnapshot | null>(null)
 
-function openCreate(): void {
-  const first = volumeOptions.value[0]
+async function beginAcceptance(volumeId: string): Promise<void> {
+  baseline.value = await captureVolumeScope(volumeId)
+}
+
+function reportSave(result: VolumeSaveResult): result is Extract<VolumeSaveResult, { ok: true }> {
+  if (!result.ok) {
+    ElMessage.error({ message: result.message, duration: 8000, showClose: true })
+    return false
+  }
+  return true
+}
+
+function isArchivedVolumeId(volumeId: string): boolean {
+  return bookStore.volumeById(volumeId)?.state === 'archived'
+}
+
+async function openCreate(): Promise<void> {
+  const first = volumeOptions.value.find((item) => !item.locked)
   if (!first) {
-    ElMessage.warning('请先登记古籍与册次')
+    ElMessage.warning('暂无可验收的册次；已归档册只能由验收人退回返修')
     return
   }
   editing.value = null
   Object.assign(form, createEmptyBindingDraft(first.value))
+  await beginAcceptance(first.value)
   dialog.value = true
 }
 
-function openEdit(binding: Binding): void {
+async function openEdit(binding: Binding): Promise<void> {
+  if (isArchivedVolumeId(binding.volumeId)) {
+    ElMessage.warning('已归档册不能直接编辑；如需改动请由验收人执行「退回返修」')
+    return
+  }
+  await beginAcceptance(binding.volumeId)
   editing.value = binding
   Object.assign(form, {
     volumeId: binding.volumeId,
@@ -131,28 +167,33 @@ async function submit(): Promise<void> {
     ElMessage.warning('请选择册次')
     return
   }
-  if (editing.value) {
-    await bindingTable.update(editing.value.id, { ...form })
-    ElMessage.success('已更新验收记录')
-  } else {
-    await bindingTable.create({ ...form }, 'bind')
-    ElMessage.success(
-      form.verdict === 'pass' ? '验收合格，已登记装订还原' : '已登记验收返修，请返回工序页重新处理'
-    )
+  if (!form.inspector.trim()) {
+    ElMessage.warning('请填写验收人')
+    return
   }
-  // 验收合格 → 触发全册归档；返修 → 回退为修复中
-  await bookStore.updateVolume(form.volumeId, {
-    state: form.verdict === 'pass' ? 'archived' : 'repairing'
-  })
-  ElMessage.info(
+  const expectedRevision = revisionOf(bookStore.volumeById(form.volumeId))
+  let result: VolumeSaveResult
+  try {
+    result = await saveAcceptanceBinding(editing.value?.id ?? null, { ...form }, expectedRevision, baseline.value)
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '保存验收记录失败')
+    return
+  }
+  if (!reportSave(result)) return
+  await Promise.all([bindingTable.refresh(), bookStore.loadVolumes()])
+  ElMessage.success(
     form.verdict === 'pass'
-      ? `第 ${volumeLabel(form.volumeId)} 已归档，整册锁定为只读`
-      : `第 ${volumeLabel(form.volumeId)} 已退回修复中`
+      ? `验收合格，第 ${volumeLabel(form.volumeId)} 已归档（第 ${result.revision} 版）`
+      : `第 ${volumeLabel(form.volumeId)} 已退回修复中（第 ${result.revision} 版）`
   )
   dialog.value = false
 }
 
 async function remove(binding: Binding): Promise<void> {
+  if (isArchivedVolumeId(binding.volumeId)) {
+    ElMessage.warning('已归档册的验收记录不能删除；如需改动请执行「退回返修」')
+    return
+  }
   try {
     await ElMessageBox.confirm('将删除该装订验收记录。', '删除验收记录', {
       type: 'warning',
@@ -162,8 +203,55 @@ async function remove(binding: Binding): Promise<void> {
   } catch {
     return
   }
-  await bindingTable.remove(binding.id)
-  ElMessage.success('已删除')
+  const scope = await captureVolumeScope(binding.volumeId)
+  let result: VolumeSaveResult
+  try {
+    result = await removeAcceptanceBinding(binding.id, revisionOf(bookStore.volumeById(binding.volumeId)), scope)
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '删除验收记录失败')
+    return
+  }
+  if (reportSave(result)) {
+    await Promise.all([bindingTable.refresh(), bookStore.loadVolumes()])
+    ElMessage.success(`已删除验收记录（第 ${result.revision} 版）`)
+  }
+}
+
+async function returnRework(binding: Binding): Promise<void> {
+  if (!isArchivedVolumeId(binding.volumeId)) return
+  let inspector = ''
+  try {
+    const prompt = await ElMessageBox.prompt('请验收人确认并填写姓名，随后将该册退回修复中', '验收人退回返修', {
+      confirmButtonText: '确认退回',
+      cancelButtonText: '取消',
+      inputPlaceholder: '如：程砚',
+      inputValue: binding.inspector
+    })
+    inspector = prompt.value || ''
+  } catch {
+    return
+  }
+  if (!inspector.trim()) {
+    ElMessage.warning('必须填写验收人')
+    return
+  }
+  const scope = await captureVolumeScope(binding.volumeId)
+  let result: VolumeSaveResult
+  try {
+    result = await returnArchivedVolumeForRework(
+      binding.id,
+      inspector.trim(),
+      revisionOf(bookStore.volumeById(binding.volumeId)),
+      scope
+    )
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '退回返修失败')
+    return
+  }
+  if (reportSave(result)) {
+    await Promise.all([bindingTable.refresh(), bookStore.loadVolumes()])
+    ElMessage.success(`验收人已将该册退回返修（第 ${result.revision} 版）`)
+  }
 }
 
 /* ----------------------------- 数据导入导出 ----------------------------- */
@@ -208,7 +296,14 @@ async function handleFile(event: Event): Promise<void> {
     return
   }
   await importSnapshot(parsed as RestoreSnapshot)
-  await Promise.all([bookStore.loadBooks(), bookStore.loadVolumes(), leafStore.loadLeaves(), repairStore.loadOrders()])
+  await Promise.all([
+    bookStore.loadBooks(),
+    bookStore.loadVolumes(),
+    leafStore.loadLeaves(),
+    repairStore.loadOrders(),
+    paperStore.loadPapers(),
+    bindingTable.refresh()
+  ])
   ElMessage.success('导入完成，数据已覆盖')
 }
 
@@ -223,7 +318,14 @@ async function handleReset(): Promise<void> {
     return
   }
   await resetDatabase()
-  await Promise.all([bookStore.loadBooks(), bookStore.loadVolumes(), leafStore.loadLeaves(), repairStore.loadOrders()])
+  await Promise.all([
+    bookStore.loadBooks(),
+    bookStore.loadVolumes(),
+    leafStore.loadLeaves(),
+    repairStore.loadOrders(),
+    paperStore.loadPapers(),
+    bindingTable.refresh()
+  ])
   ElMessage.success('已清空并重新载入演示数据')
 }
 
@@ -301,10 +403,21 @@ function verdictColor(verdict: string): string {
               </template>
             </el-table-column>
             <el-table-column prop="inspector" label="验收人" width="110" />
-            <el-table-column label="操作" width="150">
+            <el-table-column label="版本" width="80">
+              <template #default="{ row }">v{{ revisionOf(bookStore.volumeById(row.volumeId)) }}</template>
+            </el-table-column>
+            <el-table-column label="操作" width="230">
               <template #default="{ row }">
-                <el-button size="small" text :icon="Edit" @click="openEdit(row)">编辑</el-button>
-                <el-button size="small" text type="danger" :icon="Delete" @click="remove(row)">删除</el-button>
+                <el-button
+                  v-if="isArchivedVolumeId(row.volumeId)"
+                  size="small"
+                  type="warning"
+                  @click="returnRework(row)"
+                >
+                  退回返修
+                </el-button>
+                <el-button v-else size="small" text :icon="Edit" @click="openEdit(row)">编辑</el-button>
+                <el-button size="small" text type="danger" :disabled="isArchivedVolumeId(row.volumeId)" :icon="Delete" @click="remove(row)">删除</el-button>
               </template>
             </el-table-column>
           </el-table>
@@ -349,8 +462,8 @@ function verdictColor(verdict: string): string {
     <el-dialog v-model="dialog" :title="editing ? '编辑装订验收' : '新增装订验收'" width="560px">
       <el-form label-width="100px">
         <el-form-item label="册次" required>
-          <el-select v-model="form.volumeId" style="width: 100%">
-            <el-option v-for="item in volumeOptions" :key="item.value" :label="item.label" :value="item.value" />
+          <el-select v-model="form.volumeId" :disabled="Boolean(editing)" style="width: 100%">
+            <el-option v-for="item in volumeOptions.filter((option) => !option.locked)" :key="item.value" :label="item.label" :value="item.value" />
           </el-select>
         </el-form-item>
         <el-form-item label="装订方式" required>
